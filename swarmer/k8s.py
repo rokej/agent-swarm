@@ -346,6 +346,21 @@ def create_session_pat_secret(
     )
 
 
+def create_session_github_app_secret(
+    namespace: str, secret_name: str, app
+) -> None:
+    """Create a session-scoped K8s Secret for GitHub App installation auth."""
+    _apply_secret(
+        namespace,
+        secret_name,
+        {
+            "client_id": _b64(app.app_id.strip()),
+            "installation_id": _b64(app.installation_id.strip()),
+            "private_key": _b64(app.private_key),
+        },
+    )
+
+
 def create_session_mcp_secret(
     namespace: str, secret_name: str, mcp_servers
 ) -> None:

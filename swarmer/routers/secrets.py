@@ -14,7 +14,7 @@ from swarmer.routers.api_client import APIError, get_api_client
 router = APIRouter()
 templates = Jinja2Templates(directory="swarmer/templates")
 
-_VALID_TABS = ("credentials", "pats", "pull-secret")
+_VALID_TABS = ("credentials", "pats", "github-app", "pull-secret")
 
 
 def _current_user(request: Request) -> str:
@@ -40,7 +40,17 @@ async def _secrets_context(api, ws_id: int) -> dict:
     except APIError:
         pull_secret_info = None
 
-    return {"secret": secret, "pats": pats, "pull_secret_info": pull_secret_info}
+    try:
+        github_app = await api.get_github_app(ws_id)
+    except APIError:
+        github_app = None
+
+    return {
+        "secret": secret,
+        "pats": pats,
+        "pull_secret_info": pull_secret_info,
+        "github_app": github_app,
+    }
 
 
 # ============================================================
@@ -314,6 +324,73 @@ async def github_pat_delete(
             pass
 
     return RedirectResponse(url=f"/workspaces/{ws_id}/secrets?tab=pats", status_code=302)
+
+
+# ============================================================
+# GitHub App
+# ============================================================
+
+
+@router.post(
+    "/workspaces/{ws_id}/secrets/github-app",
+    dependencies=[Depends(require_auth)],
+)
+async def github_app_save(
+    ws_id: int,
+    request: Request,
+    app_id: str = Form(...),
+    installation_id: str = Form(...),
+    private_key: str = Form(""),
+    shared: str = Form(""),
+):
+    async with get_api_client(request) as api:
+        try:
+            await api.get_workspace(ws_id)
+        except APIError:
+            return RedirectResponse(url="/workspaces", status_code=302)
+
+        try:
+            await api.save_github_app(
+                ws_id,
+                app_id=app_id.strip(),
+                installation_id=installation_id.strip(),
+                private_key=private_key.strip(),
+                shared=bool(shared),
+            )
+        except APIError as exc:
+            ctx = await _secrets_context(api, ws_id)
+            try:
+                ws = await api.get_workspace(ws_id)
+            except APIError:
+                return RedirectResponse(url="/workspaces", status_code=302)
+            return templates.TemplateResponse(
+                request,
+                "secrets/tabs.html",
+                {
+                    "ws": ws,
+                    "tab": "github-app",
+                    "current_user": _current_user(request),
+                    "github_app_error": exc.detail,
+                    **ctx,
+                },
+                status_code=422,
+            )
+
+    return RedirectResponse(url=f"/workspaces/{ws_id}/secrets?tab=github-app", status_code=302)
+
+
+@router.post(
+    "/workspaces/{ws_id}/secrets/github-app/delete",
+    dependencies=[Depends(require_auth)],
+)
+async def github_app_delete(ws_id: int, request: Request):
+    async with get_api_client(request) as api:
+        try:
+            await api.delete_github_app(ws_id)
+        except APIError:
+            pass
+
+    return RedirectResponse(url=f"/workspaces/{ws_id}/secrets?tab=github-app", status_code=302)
 
 
 # ============================================================
