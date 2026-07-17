@@ -39,7 +39,7 @@ async def _make_prompt_session(db) -> Session:
     db.add(ws)
     await db.flush()
     session = Session(workspace_id=ws.id, name="my-session", mode="prompt")
-    session.run_started_at = datetime.utcnow() - timedelta(minutes=2)
+    session.run_started_at = datetime.now(timezone.utc) - timedelta(minutes=2)
     session.last_output = "agent finished"
     session.status_detail = "Completed"
     db.add(session)
@@ -52,7 +52,7 @@ async def _make_prompt_session(db) -> Session:
 async def test_record_session_run_persists_history():
     async with _TestSession() as db:
         session = await _make_prompt_session(db)
-        completed_at = datetime.utcnow()
+        completed_at = datetime.now(timezone.utc)
 
         run = await record_session_run(
             db,
@@ -91,7 +91,7 @@ async def test_record_session_run_skips_without_start_time():
             phase="succeeded",
             status_detail="",
             last_output="",
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(timezone.utc),
         )
         assert run is None
 
@@ -101,7 +101,7 @@ async def test_record_session_run_stopped_by_user_detail():
     async with _TestSession() as db:
         session = await _make_prompt_session(db)
         session.status_detail = "Running"
-        completed_at = datetime.utcnow()
+        completed_at = datetime.now(timezone.utc)
 
         run = await record_session_run(
             db,
@@ -120,7 +120,7 @@ async def test_record_session_run_stopped_by_user_detail():
 def test_session_run_duration_active_with_naive_start():
     """Legacy naive run_started_at must not break live run_duration display."""
     session = Session(workspace_id=1, name="active", mode="prompt", phase="running")
-    session.run_started_at = datetime.utcnow() - timedelta(minutes=1)
+    session.run_started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     assert session.run_duration is not None
     assert session.run_duration.endswith("s")
 
@@ -130,7 +130,7 @@ async def test_record_session_run_normalizes_mixed_timezone_awareness():
     """Legacy naive run_started_at + aware completed_at must not break run_duration."""
     async with _TestSession() as db:
         session = await _make_prompt_session(db)
-        session.run_started_at = datetime.utcnow() - timedelta(minutes=1)
+        session.run_started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
         completed_at = datetime.now(timezone.utc)
 
         run = await record_session_run(
@@ -164,7 +164,7 @@ async def test_record_session_run_prunes_old_runs(monkeypatch):
                 phase="succeeded",
                 status_detail=f"run-{i}",
                 last_output=f"log-{i}",
-                completed_at=datetime.utcnow() + timedelta(seconds=i),
+                completed_at=datetime.now(timezone.utc) + timedelta(seconds=i),
             )
         await db.commit()
 
@@ -184,11 +184,87 @@ async def test_record_session_run_prunes_old_runs(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_record_session_run_prunes_by_age(monkeypatch):
+    """Runs older than the configured max age are pruned regardless of count."""
+    from sqlalchemy import func, select
+
+    from swarmer.models.session_run import SessionRun
+
+    # Disable count-based pruning so only age-based pruning is exercised.
+    monkeypatch.setattr("swarmer.session_runs.settings.session_run_history_limit", 0)
+    monkeypatch.setattr("swarmer.session_runs.settings.session_run_history_max_age_days", 2)
+
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        now = datetime.now(timezone.utc)
+        ages_days = [10, 5, 3, 1, 0]
+        for i, age_days in enumerate(ages_days):
+            session.run_started_at = now - timedelta(days=age_days, minutes=2)
+            await record_session_run(
+                db,
+                session,
+                phase="succeeded",
+                status_detail=f"run-{i}",
+                last_output=f"log-{i}",
+                completed_at=now - timedelta(days=age_days),
+            )
+        await db.commit()
+
+        result = await db.execute(
+            select(SessionRun.status_detail)
+            .where(SessionRun.session_id == session.id)
+            .order_by(SessionRun.completed_at)
+        )
+        details = list(result.scalars().all())
+        # Only runs completed within the last 2 days (age_days 1 and 0) survive.
+        assert details == ["run-3", "run-4"]
+
+        count = await db.scalar(
+            select(func.count())
+            .select_from(SessionRun)
+            .where(SessionRun.session_id == session.id)
+        )
+        assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_age_pruning_disabled(monkeypatch):
+    """max_age_days=0 disables age-based pruning; old runs are retained."""
+    from sqlalchemy import func, select
+
+    from swarmer.models.session_run import SessionRun
+
+    monkeypatch.setattr("swarmer.session_runs.settings.session_run_history_limit", 0)
+    monkeypatch.setattr("swarmer.session_runs.settings.session_run_history_max_age_days", 0)
+
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        now = datetime.now(timezone.utc)
+        session.run_started_at = now - timedelta(days=30, minutes=2)
+        await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="ancient-run",
+            last_output="log",
+            completed_at=now - timedelta(days=30),
+        )
+        await db.commit()
+
+        count = await db.scalar(
+            select(func.count())
+            .select_from(SessionRun)
+            .where(SessionRun.session_id == session.id)
+        )
+        assert count == 1
+
+
+@pytest.mark.asyncio
 async def test_record_session_run_stores_raw_output():
     """raw_output is preserved separately from last_output in session_runs."""
     async with _TestSession() as db:
         session = await _make_prompt_session(db)
-        completed_at = datetime.utcnow()
+        completed_at = datetime.now(timezone.utc)
 
         run = await record_session_run(
             db,
@@ -220,7 +296,7 @@ async def test_record_session_run_raw_output_defaults_empty():
             phase="succeeded",
             status_detail="",
             last_output="some output",
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(timezone.utc),
             # raw_output not passed — should default to ""
         )
         await db.commit()

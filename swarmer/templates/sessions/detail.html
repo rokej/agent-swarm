@@ -38,7 +38,6 @@
     --pf-v6-c-label--Color: #fff;
   }
   .agent-pill-oc               { background: #2d2d2d; }
-  .agent-pill-crush            { background: #1a1a2e; color: #56b6c2; letter-spacing: 0.05em; }
   .agent-pill.selected {
     border: 2px solid transparent;
     background-origin: border-box;
@@ -47,12 +46,6 @@
   .agent-pill-oc.selected {
     background-image:
       linear-gradient(#1e1e1e, #1e1e1e),
-      linear-gradient(135deg, #e06c75, #e5c07b, #98c379, #56b6c2, #61afef, #c678dd);
-  }
-  .agent-pill-crush.selected {
-    color: #61dafb;
-    background-image:
-      linear-gradient(#0d1b2a, #0d1b2a),
       linear-gradient(135deg, #e06c75, #e5c07b, #98c379, #56b6c2, #61afef, #c678dd);
   }
   /* ── Log-view toggle pills (Output tab + History expanded rows) ── */
@@ -277,20 +270,11 @@
       </button>
     </li>
     {% endif %}
-    {% if session.mode == 'prompt' %}
     <li class="pf-v6-c-tabs__item" id="tab-history">
       <button class="pf-v6-c-tabs__link" role="tab" aria-selected="false" aria-controls="panel-history" tabindex="-1" onclick="switchTab('history')">
         <span class="pf-v6-c-tabs__item-text" id="history-tab-text"><span id="history-tab-dot" style="display:none;">● </span>History{% if session_runs %}&nbsp;<span style="display:inline-flex;align-items:center;justify-content:center;min-width:1.75em;height:1.75em;padding:0 0.45em;background:#111;color:#ccc;border:1px solid #444;border-radius:999px;font-size:0.875em;font-family:monospace;font-weight:700;line-height:1;vertical-align:middle;">{{ session_runs | length }}</span>{% endif %}</span>
       </button>
     </li>
-    {% endif %}
-    {% if session.mode == 'prompt' %}
-    <li class="pf-v6-c-tabs__item" id="tab-history">
-      <button class="pf-v6-c-tabs__link" role="tab" aria-selected="false" aria-controls="panel-history" tabindex="-1" onclick="switchTab('history')">
-        <span class="pf-v6-c-tabs__item-text">History{% if session_runs %} ({{ session_runs | length }}){% endif %}</span>
-      </button>
-    </li>
-    {% endif %}
     {% if session.repos %}
     <li class="pf-v6-c-tabs__item" id="tab-patch">
       <button class="pf-v6-c-tabs__link" role="tab" aria-selected="false" aria-controls="panel-patch" tabindex="-1" onclick="switchTab('patch')">
@@ -342,19 +326,11 @@
               </label>
               <div style="display:flex; gap:var(--pf-t--global--spacer--sm); align-items:center;
                           margin-top:var(--pf-t--global--spacer--xs);">
-                {% for tool in agent_tools %}
-                <button type="button"
-                        class="agent-pill agent-pill-{{ 'oc' if tool.name == 'opencode' else tool.name }}
-                               {% if canonical_agent_tool == tool.name %}selected{% endif %}"
-                        data-tool="{{ tool.name }}"
-                        onclick="selectAgentTool(this)"
-                        {% if session.is_active %}disabled{% endif %}>
-                  {% if tool.name == 'opencode' %}<svg width="78" height="14" viewBox="0 0 234 42" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:block;"><path d="M18 30H6V18H18V30Z" fill="#4B4646"/><path d="M18 12H6V30H18V12ZM24 36H0V6H24V36Z" fill="#B7B1B1"/><path d="M48 30H36V18H48V30Z" fill="#4B4646"/><path d="M36 30H48V12H36V30ZM54 36H36V42H30V6H54V36Z" fill="#B7B1B1"/><path d="M84 24V30H66V24H84Z" fill="#4B4646"/><path d="M84 24H66V30H84V36H60V6H84V24ZM66 18H78V12H66V18Z" fill="#B7B1B1"/><path d="M108 36H96V18H108V36Z" fill="#4B4646"/><path d="M108 12H96V36H90V6H108V12ZM114 36H108V12H114V36Z" fill="#B7B1B1"/><path d="M144 30H126V18H144V30Z" fill="#4B4646"/><path d="M144 12H126V30H144V36H120V6H144V12Z" fill="#F1ECEC"/><path d="M168 30H156V18H168V30Z" fill="#4B4646"/><path d="M168 12H156V30H168V12ZM174 36H150V6H174V36Z" fill="#F1ECEC"/><path d="M198 30H186V18H198V30Z" fill="#4B4646"/><path d="M198 12H186V30H198V12ZM204 36H180V6H198V0H204V36Z" fill="#F1ECEC"/><path d="M234 24V30H216V24H234Z" fill="#4B4646"/><path d="M216 12V18H228V12H216ZM234 24H216V30H234V36H210V6H234V24Z" fill="#F1ECEC"/></svg>
-                  {% elif tool.name == 'crush' %}CR╚═╝SH
-                  {% else %}{{ tool.display_name }}{% endif %}
+                {# Only OpenCode is supported — shown as a static, always-selected pill. #}
+                <button type="button" class="agent-pill agent-pill-oc selected" disabled>
+                  <svg width="78" height="14" viewBox="0 0 234 42" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:block;"><path d="M18 30H6V18H18V30Z" fill="#4B4646"/><path d="M18 12H6V30H18V12ZM24 36H0V6H24V36Z" fill="#B7B1B1"/><path d="M48 30H36V18H48V30Z" fill="#4B4646"/><path d="M36 30H48V12H36V30ZM54 36H36V42H30V6H54V36Z" fill="#B7B1B1"/><path d="M84 24V30H66V24H84Z" fill="#4B4646"/><path d="M84 24H66V30H84V36H60V6H84V24ZM66 18H78V12H66V18Z" fill="#B7B1B1"/><path d="M108 36H96V18H108V36Z" fill="#4B4646"/><path d="M108 12H96V36H90V6H108V12ZM114 36H108V12H114V36Z" fill="#B7B1B1"/><path d="M144 30H126V18H144V30Z" fill="#4B4646"/><path d="M144 12H126V30H144V36H120V6H144V12Z" fill="#F1ECEC"/><path d="M168 30H156V18H168V30Z" fill="#4B4646"/><path d="M168 12H156V30H168V12ZM174 36H150V6H174V36Z" fill="#F1ECEC"/><path d="M198 30H186V18H198V30Z" fill="#4B4646"/><path d="M198 12H186V30H198V12ZM204 36H180V6H198V0H204V36Z" fill="#F1ECEC"/><path d="M234 24V30H216V24H234Z" fill="#4B4646"/><path d="M216 12V18H228V12H216ZM234 24H216V30H234V36H210V6H234V24Z" fill="#F1ECEC"/></svg>
                 </button>
-                {% endfor %}
-                <input type="hidden" name="agent_tool" id="cfg_agent_tool" value="{{ canonical_agent_tool }}">
+                <input type="hidden" name="agent_tool" id="cfg_agent_tool" value="opencode">
               </div>
 
             </div>
@@ -362,35 +338,7 @@
             <input type="hidden" name="github_pat_id" id="cfg_pat"
                    value="{{ session.github_pat.id if session.github_pat else '' }}">
 
-            <div id="model-select-wrapper">
-            {% if model_options %}
-            <div class="pf-v6-c-form__group" style="margin-bottom:var(--pf-t--global--spacer--md);">
-              <label class="pf-v6-c-form__label" style="color:var(--pf-t--global--text--color--subtle); font-size:var(--pf-t--global--font--size--sm);">
-                <span class="pf-v6-c-form__label-text">Model</span>
-              </label>
-              <div class="pf-v6-c-form__group-control">
-                <select class="pf-v6-c-form-control" name="model" style="width:auto;"
-                        {% if session.is_active %}disabled{% endif %}>
-                  {% set ns = namespace(prev_group="") %}
-                  {% for opt in model_options %}
-                    {% if opt.group != ns.prev_group %}
-                      {% if ns.prev_group %}</optgroup>{% endif %}
-                      <optgroup label="{{ opt.group }}">
-                      {% set ns.prev_group = opt.group %}
-                    {% endif %}
-                    <option value="{{ opt.value }}"
-                            {{ 'selected' if session.model == opt.value or (loop.first and not session.model) }}>
-                      {{ opt.label }}
-                    </option>
-                  {% endfor %}
-                  {% if ns.prev_group %}</optgroup>{% endif %}
-                </select>
-              </div>
-            </div>
-            {% else %}
-            <input type="hidden" name="model" value="{{ session.model }}">
-            {% endif %}
-            </div>
+            {% include "sessions/_provider_select.html" with context %}
 
             <div class="pf-v6-c-form__group" style="margin-bottom:var(--pf-t--global--spacer--md);">
               <div style="display:flex; align-items:center;">
@@ -519,9 +467,8 @@
 {% endif %}
 
 {# ════════════════════════════════════════════════════════════
-   Tab panel: History (prompt mode)
+   Tab panel: History (all modes)
    ════════════════════════════════════════════════════════════ #}
-{% if session.mode == 'prompt' %}
 <div id="panel-history" class="pf-v6-c-tab-content" role="tabpanel" aria-labelledby="tab-history" hidden style="margin-top:var(--pf-t--global--spacer--lg);">
   <div class="pf-v6-c-card">
     <div class="pf-v6-c-card__header">
@@ -542,7 +489,6 @@
     </div>
   </div>
 </div>
-{% endif %}
 
 {# ════════════════════════════════════════════════════════════
    Tab panel: Patch (sessions with repos)
@@ -863,7 +809,10 @@ function copyCommitMsg(btn) { _copyBlock('commit-msg', btn); }
 
   window._cfgSave = doSave;
 
-  form.querySelectorAll('select, input[type=checkbox]').forEach(el => {
+  // input[type=radio] covers the AI Provider preset pills (ACM-37232) — a
+  // <select>-only selector here would silently drop provider changes from
+  // auto-save now that the "Advanced" model <select> has been removed.
+  form.querySelectorAll('select, input[type=checkbox], input[type=radio]').forEach(el => {
     el.addEventListener('change', doSave);
   });
 
@@ -938,17 +887,6 @@ document.getElementById('launch-pills') && document.getElementById('launch-pills
     if (window._cfgSave) await window._cfgSave();
   });
 })();
-
-function selectAgentTool(btn) {
-  document.querySelectorAll('.agent-pill').forEach(p => p.classList.remove('selected'));
-  btn.classList.add('selected');
-  document.getElementById('cfg_agent_tool').value = btn.dataset.tool;
-  htmx.ajax('GET',
-    '/workspaces/{{ ws.id }}/sessions/model-options?agent_tool=' + btn.dataset.tool,
-    { target: '#model-select-wrapper', swap: 'outerHTML' }
-  );
-  window._cfgSave();
-}
 
 // ── History expandable rows ──
 function toggleHistoryRow(runId) {

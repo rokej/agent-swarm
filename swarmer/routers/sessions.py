@@ -174,11 +174,21 @@ def _build_repo_context(repos, base_path: str = "/sandbox") -> str:
     return "\n".join(lines) + "\n"
 
 
-async def _get_model_options(
+async def _get_provider_options(
     ws_id: int, db: AsyncSession, agent_tool: str = "opencode"
 ) -> list[dict]:
-    """Return the available model choices for this workspace's sessions."""
-    tool = get_tool(agent_tool)
+    """Return the available AI provider choices for this workspace's sessions."""
+    try:
+        tool = get_tool(agent_tool)
+    except ValueError:
+        # Defensive fallback for legacy/removed tool names (e.g. "crush",
+        # ACM-37174) that may still be stored on old session rows if the
+        # startup migration hasn't run yet. Never 500 on a display path.
+        log.warning(
+            "_get_provider_options: unknown agent_tool %r, falling back to opencode",
+            agent_tool,
+        )
+        tool = get_tool("opencode")
     result = await db.execute(
         select(OpencodeSecret).where(OpencodeSecret.workspace_id == ws_id)
     )
@@ -190,7 +200,9 @@ async def _get_model_options(
         has_vertex = await openshell_client.provider_exists(f"swarmer-ws-{ws_id}-google-cloud")
     except Exception:
         pass
-    return tool.get_model_options(oc, has_vertex=has_vertex)
+    # Google AI Studio key still lives encrypted in the DB pending ACM-37263.
+    has_gemini = bool(oc and oc.google_api_key_enc)
+    return tool.get_model_options(oc, has_vertex=has_vertex, has_gemini=has_gemini)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="swarmer/templates")
@@ -236,28 +248,28 @@ async def _get_prompt_sources(ws_id: int, db: AsyncSession) -> list[WorkspacePro
 
 
 # ============================================================
-# Model options (HTMX partial — reloads when agent tool changes)
+# Provider options (HTMX partial — reloads when agent tool changes)
 # ============================================================
 
 @router.get(
-    "/workspaces/{ws_id}/sessions/model-options",
+    "/workspaces/{ws_id}/sessions/provider-options",
     dependencies=[Depends(require_auth)],
     response_class=HTMLResponse,
 )
-async def model_options_partial(
+async def provider_options_partial(
     ws_id: int,
     request: Request,
     agent_tool: str = "opencode",
-    selected_model: str = "",
+    selected_provider: str = "",
     db: AsyncSession = Depends(get_db),
 ):
-    model_options = await _get_model_options(ws_id, db, agent_tool)
+    provider_options = await _get_provider_options(ws_id, db, agent_tool)
     return templates.TemplateResponse(
         request,
-        "sessions/_model_select.html",
+        "sessions/_provider_select.html",
         {
-            "model_options": model_options,
-            "selected_model": selected_model,
+            "provider_options": provider_options,
+            "selected_provider": selected_provider,
         },
     )
 
@@ -376,7 +388,7 @@ async def session_new(
         default_agent_tool = get_tool(settings.default_agent_tool).name
     except ValueError:
         default_agent_tool = "opencode"
-    model_options = await _get_model_options(ws_id, db, default_agent_tool)
+    provider_options = await _get_provider_options(ws_id, db, default_agent_tool)
     _avail = await asyncio.gather(
         *[k8s.get_image_available(t.get_image(), ws.k8s_namespace) for t in _tools]
     )
@@ -389,8 +401,8 @@ async def session_new(
         {
             "ws": ws,
             "pats": pats,
-            "model_options": model_options,
-            "selected_model": "",
+            "provider_options": provider_options,
+            "selected_provider": "",
             "agent_tools": _tools,
             "default_agent_tool": default_agent_tool,
             "tool_image_available": dict(zip([t.name for t in _tools], _avail, strict=False)),
@@ -408,7 +420,7 @@ async def session_create(
     github_pat_id: str = Form(""),
     prompt_id: str = Form(""),
     instruction_prompt: str = Form(""),
-    model: str = Form(""),
+    provider: str = Form(""),
     agent_tool: str = Form("opencode"),
     working_branch: str = Form(""),
     db: AsyncSession = Depends(get_db),
@@ -447,9 +459,13 @@ async def session_create(
     except ValueError:
         agent_tool = "opencode"
 
-    if not model.strip():
-        opts = await _get_model_options(ws_id, db, agent_tool)
-        model = opts[0]["value"] if opts else ""
+    if not provider.strip():
+        opts = await _get_provider_options(ws_id, db, agent_tool)
+        # Always select an available provider when at least one AI token/credential
+        # is configured. Only leave the selection empty when NO provider is
+        # available at all — there is nothing usable to default to.
+        _available = [o for o in opts if o.get("available", True)]
+        provider = _available[0].get("value", "") if _available else ""
 
     wb = working_branch.strip()
     if wb and not _is_valid_ref_name(wb):
@@ -461,7 +477,7 @@ async def session_create(
         github_pat_id=pat_id,
         prompt_id=pid,
         name=name.strip(),
-        model=model.strip(),
+        provider=provider.strip(),
         instruction_prompt=instruction_prompt.strip(),
         agent_tool=agent_tool,
         working_branch=wb,
@@ -492,7 +508,7 @@ async def session_create(
             default_agent_tool = get_tool(settings.default_agent_tool).name
         except ValueError:
             default_agent_tool = "opencode"
-        model_options = await _get_model_options(ws_id, db, default_agent_tool)
+        provider_options = await _get_provider_options(ws_id, db, default_agent_tool)
         _avail = await asyncio.gather(
             *[k8s.get_image_available(t.get_image(), ws.k8s_namespace) for t in _tools]
         )
@@ -507,8 +523,8 @@ async def session_create(
                 "pats": pats,
                 "error": f"A session named '{name}' already exists in this workspace.",
                 "form": {"name": name, "instruction_prompt": instruction_prompt},
-                "model_options": model_options,
-                "selected_model": model,
+                "provider_options": provider_options,
+                "selected_provider": provider,
                 "agent_tools": _tools,
                 "default_agent_tool": default_agent_tool,
                 "tool_image_available": dict(zip([t.name for t in _tools], _avail, strict=False)),
@@ -556,7 +572,7 @@ async def session_detail(
         tokens.append(tui_token)
         request.session["tui_tokens"] = tokens
 
-    model_options = await _get_model_options(ws_id, db, session.agent_tool)
+    provider_options = await _get_provider_options(ws_id, db, session.agent_tool)
     # Resolve repo check token BEFORE any additional DB queries — extra queries
     # on the same async session can interfere with loaded relationship attributes.
     _repo_check_token = await _resolve_token_for_repo_check(
@@ -581,17 +597,15 @@ async def session_detail(
     if session.phase == "queued":
         queue_position = await _get_queue_position(session.id, db)
     capacity = await _get_capacity_summary(ws_id, db)
-    session_runs: list = []
-    if session.mode == "prompt":
-        from swarmer.models.session_run import SessionRun
+    from swarmer.models.session_run import SessionRun
 
-        runs_result = await db.execute(
-            select(SessionRun)
-            .where(SessionRun.session_id == sid)
-            .order_by(desc(SessionRun.completed_at))
-            .limit(100)
-        )
-        session_runs = list(runs_result.scalars().all())
+    runs_result = await db.execute(
+        select(SessionRun)
+        .where(SessionRun.session_id == sid)
+        .order_by(desc(SessionRun.completed_at))
+        .limit(100)
+    )
+    session_runs = list(runs_result.scalars().all())
     return templates.TemplateResponse(
         request,
         "sessions/detail.html",
@@ -608,7 +622,9 @@ async def session_detail(
             "status_detail": status_detail,
             "queue_position": queue_position,
             "capacity": capacity,
-            "model_options": model_options,
+            "provider_options": provider_options,
+            "selected_provider": session.provider,
+            "provider_select_disabled": session.is_active,
             "repo_info": repo_info,
             "has_github_app": bool(_ws_github_app),
             "agent_tools": _tools,
@@ -646,7 +662,7 @@ async def session_edit(
     prompt_id: str = Form(""),
     instruction_prompt: str = Form(""),
     mode: str = Form("prompt"),
-    model: str = Form(""),
+    provider: str = Form(""),
     agent_tool: str = Form("opencode"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -687,7 +703,7 @@ async def session_edit(
     session.instruction_prompt = instruction_prompt.strip()
     if mode in ("tui", "server", "prompt"):
         session.mode = mode
-    session.model = model.strip()
+    session.provider = provider.strip()
     try:
         session.agent_tool = get_tool(agent_tool).name
     except ValueError:
@@ -991,12 +1007,28 @@ async def _do_launch_openshell(
 
     tool = get_tool(session.agent_tool)
 
-    # Resolve model first so it is available for provider registration and policy building
-    if session.model and tool.is_valid_model(session.model):
-        model = session.model
+    # Resolve the provider first so it is available for provider registration and
+    # policy building. session.provider is a family preset name ("claude"/"gemini",
+    # ACM-37232) — build_config_data() understands it directly. Everything else
+    # (network policy, CLI --model flag, model.json state) needs a concrete model
+    # ID, so it uses `model` — the provider resolved to its BUILD-role model —
+    # instead. Raw provider/model@version strings from pre-ACM-37232 sessions are
+    # also still accepted for backward compatibility.
+    if session.provider and tool.is_valid_model(session.provider):
+        raw_model = session.provider
+        log.info(
+            "_do_launch_openshell: session %d using stored provider %r (tool=%s)",
+            session.id, raw_model, tool.name,
+        )
     else:
-        model = tool.get_default_model(has_adc)
-    model = model.strip("\r\n")  # strip any stray line endings before embedding in shell commands
+        raw_model = tool.get_default_model(has_adc)
+        log.info(
+            "_do_launch_openshell: session %d stored provider %r invalid/empty — "
+            "falling back to default %r (tool=%s, has_adc=%s)",
+            session.id, session.provider, raw_model, tool.name, has_adc,
+        )
+    raw_model = raw_model.strip("\r\n")  # strip any stray line endings before embedding in shell commands
+    model = tool.resolve_build_model(raw_model)
 
     # Query workspace env vars from DB before releasing the connection.
     from sqlalchemy import select as sa_select
@@ -1063,6 +1095,11 @@ async def _do_launch_openshell(
     # OPENCODE_CONFIG env var (there is no --config CLI flag).
     if tool.name == "opencode":
         env_vars["OPENCODE_CONFIG"] = "/sandbox/opencode.json"
+        # Enables the opencode plan agent so a preset's PLAN model (written into
+        # opencode.json's agent.plan.model by build_config_data()) is actually
+        # used (ACM-37232). Without this flag the plan agent/tool never engages.
+        if settings.opencode_experimental_plan_mode:
+            env_vars["OPENCODE_EXPERIMENTAL_PLAN_MODE"] = "true"
 
     # 1b. Create/update gateway providers for each available credential.
     #     Must happen BEFORE sandbox creation: provider names go into SandboxSpec.providers
@@ -1176,7 +1213,7 @@ async def _do_launch_openshell(
     # ORM objects cannot be used across DB sessions.
     mcp_patch: dict = {}
     if mcp_servers:
-        config_data = tool.build_config_data(secret=oc_secret, mcp_servers=mcp_servers, model=model)
+        config_data = tool.build_config_data(secret=oc_secret, mcp_servers=mcp_servers, model=raw_model)
         config_json = config_data.get(f"{tool.name}.json", "{}")
         try:
             mcp_patch = _json.loads(config_json).get("mcp", {})
@@ -1219,7 +1256,7 @@ async def _do_launch_openshell(
     resolved_prompt_safe = resolved_prompt or ""
     model_setup_cmd = tool.build_model_setup_cmd(model).replace("/workspace/", "/sandbox/")
     share_cmd = tool.build_share_setup_cmd().replace("/workspace/", "/sandbox/")
-    # Resolve image early so a missing config (e.g. AGENT_IMAGE_CRUSH not set) fails
+    # Resolve image early so a missing config (e.g. AGENT_IMAGE_OPENCODE not set) fails
     # before we mark the session pending and commit — keeps the error visible.
     image = tool.get_image()
     if not image:
@@ -1234,7 +1271,7 @@ async def _do_launch_openshell(
     session.raw_output = ""
     session.status_detail = ""   # clear stale status from any previous run
     session.policy_chunks = ""   # clear stale chunks; fresh snapshot at completion
-    session.run_started_at = datetime.utcnow()
+    session.run_started_at = datetime.now(timezone.utc)
     session.run_completed_at = None
     await db.commit()
 
@@ -1249,6 +1286,7 @@ async def _do_launch_openshell(
             image=image,
             tool_name=tool.name,
             model=model,
+            config_model=raw_model,
             model_setup_cmd=model_setup_cmd,
             share_cmd=share_cmd,
             mcp_patch=mcp_patch,
@@ -1292,6 +1330,7 @@ async def _setup_openshell_sandbox(
     mode: str,
     main_cmd: str,
     resolved_prompt: str = "",
+    config_model: str = "",
     has_git_token: bool = False,
     # GitHub App IAT refresh loop params (all empty when using PAT fallback)
     iat_app_id: str = "",
@@ -1368,7 +1407,7 @@ async def _setup_openshell_sandbox(
         ] if mcp_patch else []
         _config_data = _tool.build_config_data(
             mcp_servers=_mcp_list,
-            model=model,
+            model=config_model or model,
         )
         _config_json = _config_data.get(f"{tool_name}.json", "{}")
         await openshell_client.write_agent_config(
@@ -1442,14 +1481,49 @@ async def _setup_openshell_sandbox(
             await openshell_client.exec_command(
                 ref.name, ["sh", "-c", "git config --global --add safe.directory '*'"], client=None
             )
+            # Checkout each repo's configured branch before creating the working
+            # branch so the working branch is based on the correct upstream ref
+            # (e.g. "develop") rather than always the repository default branch.
+            for rd in repos_data:
+                repo_branch = rd.get("branch", "")
+                if repo_branch:
+                    checkout_base_cmd = (
+                        f"cd /sandbox/{shlex.quote(rd['local_path'])} && "
+                        f"git checkout {shlex.quote(repo_branch)}"
+                    )
+                    result = await openshell_client.exec_command(
+                        ref.name, ["sh", "-c", checkout_base_cmd], client=None
+                    )
+                    if getattr(result, "exit_code", 0) != 0:
+                        _stdout = getattr(result, "stdout", "") or ""
+                        _stderr = getattr(result, "stderr", "") or ""
+                        log.warning(
+                            "sandbox setup: git checkout %s failed for %s (exit %s):\n%s",
+                            repo_branch,
+                            rd["local_path"],
+                            getattr(result, "exit_code", "?"),
+                            (_stdout + _stderr).strip(),
+                        )
             if working_branch:
                 for rd in repos_data:
                     branch_cmd = (
-                        f"cd /sandbox/{rd['local_path']} && "
+                        f"cd /sandbox/{shlex.quote(rd['local_path'])} && "
                         f"git checkout -b {shlex.quote(working_branch)} 2>/dev/null "
                         f"|| git checkout {shlex.quote(working_branch)}"
                     )
-                    await openshell_client.exec_command(ref.name, ["sh", "-c", branch_cmd], client=None)
+                    result = await openshell_client.exec_command(
+                        ref.name, ["sh", "-c", branch_cmd], client=None
+                    )
+                    if getattr(result, "exit_code", 0) != 0:
+                        _stdout = getattr(result, "stdout", "") or ""
+                        _stderr = getattr(result, "stderr", "") or ""
+                        log.warning(
+                            "sandbox setup: git checkout working branch %s failed for %s (exit %s):\n%s",
+                            working_branch,
+                            rd["local_path"],
+                            getattr(result, "exit_code", "?"),
+                            (_stdout + _stderr).strip(),
+                        )
 
         # Build the agent command.
         # Prompt mode: AGENTS.md was written above (prompt + repo context); read it at
@@ -1458,14 +1532,11 @@ async def _setup_openshell_sandbox(
         # TUI/server: main_cmd is "sleep infinity" / "opencode serve …"; agent is
         # started later by the WebSocket handler or start_agent().
         if mode == "prompt":
-            _tool_bin = {"opencode": "opencode run", "crush": "crush run"}.get(tool_name, "opencode run")
+            _tool_bin = {"opencode": "opencode run"}.get(tool_name, "opencode run")
             if agents_md:
                 # Read the full AGENTS.md (prompt + repo context) as the CLI argument.
-                if tool_name == "crush":
-                    agent_cmd = f"HOME=/sandbox {_tool_bin} \"$(</sandbox/AGENTS.md)\""
-                else:
-                    _model_arg = shlex.quote(model) if model else ""
-                    agent_cmd = f"HOME=/sandbox {_tool_bin} --model {_model_arg} \"$(</sandbox/AGENTS.md)\""
+                _model_arg = shlex.quote(model) if model else ""
+                agent_cmd = f"HOME=/sandbox {_tool_bin} --model {_model_arg} \"$(</sandbox/AGENTS.md)\""
             else:
                 # No prompt configured — launch without a message argument.
                 agent_cmd = f"HOME=/sandbox {main_cmd}"
@@ -1523,7 +1594,7 @@ async def _setup_openshell_sandbox(
         raise
     except Exception:
         log.exception("_setup_openshell_sandbox failed for session %d", session_id)
-        await _update_db(phase="failed", run_completed_at=datetime.utcnow())
+        await _update_db(phase="failed", run_completed_at=datetime.now(timezone.utc))
 
 
 async def _run_openshell_agent(
@@ -1586,8 +1657,7 @@ async def _run_openshell_agent(
             # on_output is called every 5 s with accumulated stdout/stderr so the
             # HTMX UI updates incrementally without waiting for the run to finish.
             # OpenCode writes minimal stdout (content lives in its SQLite DB), so
-            # the streaming output is most useful for Crush; for OpenCode we do a
-            # final read_opencode_response call after the exec completes.
+            # we do a final read_opencode_response call after the exec completes.
             _streamed: list[str] = []  # tracks last value passed to on_output
 
             async def _on_output(text: str) -> None:
@@ -1611,14 +1681,11 @@ async def _run_openshell_agent(
             # incremental stdout that on_output already captured, but only the
             # last chunk — the accumulated buffer has everything).
             _streamed_text = _streamed[0] if _streamed else ""
-            if agent_tool == "opencode":
-                output = (
-                    await openshell_client.read_opencode_response(sandbox_name)
-                    or _streamed_text
-                    or stderr
-                )
-            else:
-                output = _streamed_text or stderr
+            output = (
+                await openshell_client.read_opencode_response(sandbox_name)
+                or _streamed_text
+                or stderr
+            )
 
             # Snapshot draft policy chunks before any sandbox deletion so the
             # Policy tab can show what was denied/proposed during this run.
@@ -1657,7 +1724,7 @@ async def _run_openshell_agent(
                 raw_output=_streamed_text,  # preserve raw console log regardless of agent tool
                 status_detail="",  # clear any stale status from previous runs
                 policy_chunks=chunks_json,
-                run_completed_at=datetime.utcnow(),
+                run_completed_at=datetime.now(timezone.utc),
                 sandbox_name=new_sandbox_name,
                 active_schedule_id=None,
             )
@@ -1694,7 +1761,7 @@ async def _run_openshell_agent(
                     await _update_db(
                         phase="failed",
                         status_detail="Failed to expose service URL — check server logs",
-                        run_completed_at=datetime.utcnow(),
+                        run_completed_at=datetime.now(timezone.utc),
                     )
 
     except asyncio.CancelledError:
@@ -1704,7 +1771,7 @@ async def _run_openshell_agent(
         await _update_db(
             phase="failed",
             status_detail="OpenShell agent startup failed",
-            run_completed_at=datetime.utcnow(),
+            run_completed_at=datetime.now(timezone.utc),
         )
 
 
@@ -1723,7 +1790,7 @@ async def session_launch(
     prompt_id: str = Form(""),
     instruction_prompt: str = Form(""),
     mode: str = Form(""),
-    model: str = Form(""),
+    provider: str = Form(""),
     redirect_to: str = Form(""),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1766,8 +1833,8 @@ async def session_launch(
         session.instruction_prompt = instruction_prompt.strip()
         if mode in ("tui", "server", "prompt"):
             session.mode = mode
-        if model.strip():
-            session.model = model.strip()
+        if provider.strip():
+            session.provider = provider.strip()
     else:
         # List-page launch: no explicit mode chosen — default to prompt so the
         # session runs once and exits rather than starting a TUI or server.
@@ -1778,7 +1845,7 @@ async def session_launch(
             canonical = get_tool(agent_tool).name
             if canonical != session.agent_tool:
                 session.agent_tool = canonical
-                session.model = ""  # stale model from previous tool may be incompatible
+                session.provider = ""  # stale provider from previous tool may be incompatible
         except ValueError:
             pass
 
@@ -1929,7 +1996,7 @@ async def session_schedule(
         return RedirectResponse(url=f"/workspaces/{ws_id}/sessions/{sid}#schedule", status_code=302)
 
     session.cron_schedule = cron_expr
-    session.cron_next_run = croniter(cron_expr, datetime.utcnow()).get_next(datetime)
+    session.cron_next_run = croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
     await db.commit()
 
     flash(request, f"Schedule set: {session.cron_label or cron_expr}. Next run: {session.cron_next_run.strftime('%b %d %H:%M UTC')}", "success")
@@ -2036,7 +2103,7 @@ async def schedule_create(
     sched = SessionSchedule(
         session_id=sid,
         cron_schedule=cron_expr,
-        cron_next_run=_croniter(cron_expr, datetime.utcnow()).get_next(datetime),
+        cron_next_run=_croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime),
         label=label.strip(),
         prompt_id=pid,
         instruction_prompt=instruction_prompt,
@@ -2077,7 +2144,7 @@ async def schedule_edit(
         return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
 
     sched.cron_schedule = cron_expr
-    sched.cron_next_run = _croniter(cron_expr, datetime.utcnow()).get_next(datetime)
+    sched.cron_next_run = _croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
     sched.label = label.strip()
     sched.prompt_id = int(prompt_id) if prompt_id.strip().isdigit() else None
     sched.instruction_prompt = instruction_prompt
@@ -2623,18 +2690,18 @@ async def session_set_mode(
 
 
 # ============================================================
-# Set model (server / TUI modes — works while running)
+# Set provider (server / TUI modes — works while running)
 # ============================================================
 
 @router.post(
-    "/workspaces/{ws_id}/sessions/{sid}/set-model",
+    "/workspaces/{ws_id}/sessions/{sid}/set-provider",
     dependencies=[Depends(require_auth)],
 )
-async def session_set_model(
+async def session_set_provider(
     ws_id: int,
     sid: int,
     request: Request,
-    model: str = Form(""),
+    provider: str = Form(""),
     db: AsyncSession = Depends(get_db),
 ):
     ws = await _get_workspace(ws_id, db)
@@ -2642,10 +2709,10 @@ async def session_set_model(
     if ws is None or session is None or session.workspace_id != ws_id:
         return RedirectResponse(url=f"/workspaces/{ws_id}/sessions", status_code=302)
 
-    session.model = model.strip()
+    session.provider = provider.strip()
     await db.commit()
 
-    flash(request, "Model saved; will apply on next launch.", "success")
+    flash(request, "Provider saved; will apply on next launch.", "success")
 
     return RedirectResponse(url=f"/workspaces/{ws_id}/sessions/{sid}", status_code=302)
 
