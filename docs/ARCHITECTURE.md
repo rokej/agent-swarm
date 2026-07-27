@@ -179,7 +179,7 @@ All kubernetes client imports remain lazy (inside functions) to avoid import err
 | `configure_vertex_provider()` | `async (provider_name, adc_json, project, location, client?) → None` | Configures google-vertex-ai provider with ADC-based token refresh |
 | `enable_providers_v2()` | `async (client?) → None` | Enables `providers_v2_enabled` gateway feature flag (required for google-vertex-ai) |
 | `set_cluster_inference()` | `async (provider_name, model_id, no_verify?, client?) → None` | Configures inference.local cluster proxy to use a provider+model |
-| `create_sandbox()` | `async (image, env_vars, policy, provider_names?, client?) → SandboxRef` | Creates sandbox, waits ready, returns ref |
+| `create_sandbox()` | `async (image, env_vars, policy, provider_names?, ephemeral_storage?, client?) → SandboxRef` | Creates sandbox, waits ready, returns ref. `ephemeral_storage` (e.g. `"5Gi"`), sourced per-session from `Session.ephemeral_disk` (ACM-38184), sets `SandboxTemplate.resources` requests/limits — empty string leaves it unset. This only bounds the sandbox pod's ephemeral-storage compute resource (container writable layer / unsized emptyDirs); it does **not** resize `/sandbox`, which is a separate PVC (`workspace-{sandbox-name}`) sized by the gateway's `server.workspaceDefaultStorageSize` Helm value (`OPENSHELL_WORKSPACE_STORAGE` in the Makefile, default `10Gi`) — see ACM-38172, ACM-38184 |
 | `delete_sandbox()` | `async (sandbox_name, client?) → None` | Deletes sandbox by name |
 | `write_agent_config()` | `async (sandbox_name, tool_name, config_json, client?) → None` | Writes tool config JSON to `/sandbox/{tool}.json` |
 | `write_agents_md()` | `async (sandbox_name, content, client?) → None` | Writes AGENTS.md to `/sandbox/` |
@@ -221,6 +221,8 @@ All settings live in `swarmer/config.py` (`Settings` class) and are read from en
 | `openshell_bearer_token` | `OPENSHELL_BEARER_TOKEN` | `str` | `""` | Bearer token for Gateway/Supervisor authentication |
 | `sandbox_gc_interval` | `SANDBOX_GC_INTERVAL` | `int` | `300` | Seconds between sandbox garbage-collection sweeps |
 
+> **Ephemeral disk (ACM-38184):** Sandbox ephemeral-storage is a **per-session** setting (`Session.ephemeral_disk`, one of `2Gi`/`5Gi`/`10Gi`, default `2Gi`), configurable via a dropdown on the session create/edit UI — not a global env var. It bounds the sandbox pod's ephemeral-storage compute resource (container writable layer / unsized emptyDirs) and is passed to `create_sandbox(ephemeral_storage=...)` at launch. It does **not** resize the `/sandbox` working directory — see `workspaceDefaultStorageSize` below.
+
 ### Model Preset Settings (ACM-37232)
 
 Claude/Gemini preset → model-ID mappings, read from env vars via `swarmer/config.py`'s `Settings`
@@ -244,8 +246,8 @@ Deployment; `make delete` removes it.
 | `claude_preset_build_model` | `CLAUDE_PRESET_BUILD_MODEL` | `google-vertex-anthropic/claude-sonnet-5@default` | Claude preset's BUILD-role model |
 | `claude_preset_small_model` | `CLAUDE_PRESET_SMALL_MODEL` | `google-vertex-anthropic/claude-haiku-4-5@20251001` | Claude preset's small/housekeeping model |
 | `gemini_preset_plan_model` | `GEMINI_PRESET_PLAN_MODEL` | `google/gemini-3.1-pro-preview` | Gemini preset's PLAN-role model |
-| `gemini_preset_build_model` | `GEMINI_PRESET_BUILD_MODEL` | `google/gemini-3.5-flash` | Gemini preset's BUILD-role model |
-| `gemini_preset_small_model` | `GEMINI_PRESET_SMALL_MODEL` | `google/gemini-3.1-flash-lite` | Gemini preset's small/housekeeping model |
+| `gemini_preset_build_model` | `GEMINI_PRESET_BUILD_MODEL` | `google/gemini-3.6-flash` | Gemini preset's BUILD-role model |
+| `gemini_preset_small_model` | `GEMINI_PRESET_SMALL_MODEL` | `google/gemini-3.5-flash-lite` | Gemini preset's small/housekeeping model |
 | `opencode_experimental_plan_mode` | `OPENCODE_EXPERIMENTAL_PLAN_MODE` | `true` | Enables the opencode plan agent so the PLAN-role model above is actually used |
 
 For local dev (`make dev`), the same env vars are set via `.env` (see `.env.example`) — no
@@ -269,7 +271,7 @@ Every data item Swarmer currently pushes into agent pods, its source model, the 
 | Extra Env | Arbitrary workspace key-value pairs | External K8s Secret | `envFrom` (`swarmer-agent-extra-env`, optional) | Gateway env injection |
 | Volumes | PVC → /workspace, ConfigMap → /tmp/agent-config-ro, ADC → /app/gcloud | N/A | Pod volume spec | Sandbox filesystem (no separate volumes) |
 | Startup Script | Config copy, safe dir, git creds, symlinks, AGENTS.md write, model write, branch checkout | N/A | `sh -c` command chain | Simplified script — removes credential setup and git clone stages |
-| Pod Config | Resources (1Gi-8Gi/500m-2000m), fsGroup, runAsUser, imagePullPolicy, restartPolicy | `Session` + `Settings` | Pod spec | Sandbox resource config |
+| Pod Config | Resources (1Gi-8Gi/500m-2000m), fsGroup, runAsUser, imagePullPolicy, restartPolicy | `Session` + `Settings` | Pod spec | Sandbox resource config — ephemeral storage set per-session via `Session.ephemeral_disk` (dropdown: `2Gi`/`5Gi`/`10Gi`, default `2Gi`), passed to `create_sandbox(ephemeral_storage=...)`. The OpenShell gateway's `workspaceDefaultStorageSize` Helm value (`OPENSHELL_WORKSPACE_STORAGE` in the Makefile, default `10Gi`) is a separate, gateway-wide ceiling for the `/sandbox` PVC — only applied on first OpenShell install |
 | Networking | Container port 4096 (server mode), ClusterIP Service, OpenShift Route | `Session.mode` | K8s Service/Route | OpenShell network endpoint |
 
 - **Startup script simplification** -- the OpenShell startup script removes: credential helper setup, git clone, `envFrom` secret injection, ADC volume mount. Keeps: config copy, MCP config overwrite, model JSON write, AGENTS.md write, branch checkout, agent binary invocation

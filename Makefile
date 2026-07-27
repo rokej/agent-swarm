@@ -33,14 +33,21 @@ OS_LOCAL_PORT   ?= 17671
 AC_DEFAULTS ?= .push-defaults
 
 # OpenShell gateway
-OPENSHELL_VERSION        ?= 0.0.70
+OPENSHELL_VERSION        ?= 0.0.82
 # agent-sandbox v0.4.6 is required — v0.5.0+ graduates the CRD to v1beta1 and
 # sets ownerReference apiVersion=agents.x-k8s.io/v1beta1 on sandbox pods, but
-# the OpenShell gateway (through at least 0.0.70) checks for v1alpha1 in
+# the OpenShell gateway (through at least 0.0.82) checks for v1alpha1 in
 # IssueSandboxToken, causing "Policy fetch failed" on every sandbox launch.
 AGENT_SANDBOX_VERSION    ?= v0.4.6
 OPENSHELL_NAMESPACE      ?= openshell
 OPENSHELL_TLS_DIR        ?= auth/openshell
+# Default size of the workspace PVC (backing each sandbox's /sandbox mount) at the
+# OpenShell gateway level. Per-session ephemeral disk selection (ACM-38184) only
+# controls the sandbox pod's ephemeral-storage COMPUTE resource, not this PVC — so
+# this is set to the largest per-session dropdown option (2Gi/5Gi/10Gi) as a ceiling
+# that comfortably fits any session. Override with OPENSHELL_WORKSPACE_STORAGE=<val>
+# if needed; only applied on first OpenShell install (see the deploy target).
+OPENSHELL_WORKSPACE_STORAGE ?= 10Gi
 
 # ──────────────────────────────────────────────────────────────
 #  Phony targets
@@ -56,13 +63,27 @@ OPENSHELL_TLS_DIR        ?= auth/openshell
 #  Developer tooling
 # ──────────────────────────────────────────────────────────────
 
-sync-images:  ## Sync AGENT_IMAGE_OPENCODE in .env from .push-defaults
+sync-images:  ## Sync AGENT_IMAGE_OPENCODE in .env from ../agent-containers .push-defaults
 	@test -f $(AC_DEFAULTS) || (echo "$(AC_DEFAULTS) not found — create/update .push-defaults first" && exit 1)
 	$(eval AC_REGISTRY := $(shell grep '^REGISTRY=' $(AC_DEFAULTS) | cut -d= -f2-))
 	$(eval AC_TAG      := $(shell grep '^IMAGE_TAG=' $(AC_DEFAULTS) | cut -d= -f2-))
+	@test -n "$(AC_REGISTRY)" -a -n "$(AC_TAG)" || (echo "Error: REGISTRY or IMAGE_TAG missing from $(AC_DEFAULTS)" && exit 1)
+	@echo "$(AC_REGISTRY)" | grep -Eq '^[A-Za-z0-9.:_/-]+$$' || \
+	  (echo "Error: REGISTRY in $(AC_DEFAULTS) contains unsupported characters" >&2 && exit 1)
+	@echo "$(AC_TAG)" | grep -Eq '^[A-Za-z0-9._-]+$$' || \
+	  (echo "Error: IMAGE_TAG in $(AC_DEFAULTS) contains unsupported characters" >&2 && exit 1)
 	@echo "Syncing agent image → $(AC_REGISTRY)/opencode:$(AC_TAG)"
-	@sed -i "s|^AGENT_IMAGE_OPENCODE=.*|AGENT_IMAGE_OPENCODE=$(AC_REGISTRY)/opencode:$(AC_TAG)|" .env
-	@echo "Updated .env"
+	@if [ -f .env ]; then \
+	  grep -q "^AGENT_IMAGE_OPENCODE=" .env || echo "AGENT_IMAGE_OPENCODE=" >> .env; \
+	  sed -i "s|^AGENT_IMAGE_OPENCODE=.*|AGENT_IMAGE_OPENCODE=$(AC_REGISTRY)/opencode:$(AC_TAG)|" .env \
+	    && echo "✓ Updated .env" \
+	    || (echo "Error: failed to update .env" >&2 && exit 1); \
+	else \
+	  echo "  (no .env found — skipped; run 'cp .env.example .env' first if you need one)"; \
+	fi
+	@# NOTE: .env.example is committed and must never contain a real registry/image
+	@# reference (Sensitive Data Policy) — .push-defaults is developer-local and
+	@# often points at a personal registry, so it is intentionally NOT synced here.
 
 setup-secret:  ## Generate a new SWARMER_SECRET_KEY and save to auth/secret.key
 	@mkdir -p auth
@@ -81,23 +102,110 @@ user-token:  ## Issue a login token for a K8s user  (SA_USER=alice, TOKEN_DURATI
 	@echo "Paste this token into the Swarmer login page."
 	@echo "Grant workspace access with: make grant-workspace-access SA_USER=$(SA_USER) WORKSPACE_NS=<ns>"
 
-grant-workspace-access:  ## Grant a user access to a specific workspace namespace  (SA_USER=alice, WORKSPACE_NS=my-project)
-	@test -n "$(SA_USER)"      || (echo "Usage: make grant-workspace-access SA_USER=<name> WORKSPACE_NS=<ns>" && exit 1)
-	@test -n "$(WORKSPACE_NS)" || (echo "Usage: make grant-workspace-access SA_USER=<name> WORKSPACE_NS=<ns>" && exit 1)
-	kubectl create rolebinding swarmer-user-$(SA_USER) \
-	  --clusterrole=swarmer-user \
-	  --serviceaccount=$(NAMESPACE):$(SA_USER) \
-	  --namespace=$(WORKSPACE_NS) \
-	  --dry-run=client -o yaml | kubectl apply -f -
-	@echo "$(SA_USER) can now access workspace namespace '$(WORKSPACE_NS)'."
+# SA_USER/OIDC_USER/WORKSPACE_NS/NAMESPACE are carried as exported shell env
+# vars (not textually substituted into the recipe) and validated against a
+# strict allow-list before ever reaching kubectl, so a value containing
+# shell metacharacters cannot alter the command that runs.
+#
+# NOTE: the exported shell variables are deliberately named differently from
+# the Make command-line variables they're sourced from (_SA_USER vs SA_USER).
+# `target: export SA_USER := $(value SA_USER)` (i.e. reusing the same name)
+# creates a self-referential target-specific variable that shadows the
+# global SA_USER while evaluating its own right-hand side, causing GNU Make
+# to silently truncate values containing "$(...)" sequences (e.g.
+# "alice$(touch /x)" collapses to "alice") *before* our allow-list check
+# ever runs. Using a distinct name avoids this Make quirk entirely.
 
-grant-workspace-create:  ## Allow a user to create new workspaces  (SA_USER=alice)
-	@test -n "$(SA_USER)" || (echo "Usage: make grant-workspace-create SA_USER=<name>" && exit 1)
-	kubectl create clusterrolebinding swarmer-workspace-creator-$(SA_USER) \
-	  --clusterrole=swarmer-workspace-creator \
-	  --serviceaccount=$(NAMESPACE):$(SA_USER) \
-	  --dry-run=client -o yaml | kubectl apply -f -
-	@echo "$(SA_USER) can now create new workspaces (but cannot see others' workspaces without grant-workspace-access)."
+# The SA_USER/OIDC_USER allow-list above permits characters (. _ : @) that
+# are NOT valid in a Kubernetes object name (RoleBinding/ClusterRoleBinding
+# `metadata.name` must be a DNS-1123 subdomain: lowercase alphanumeric and
+# '-' or '.', max 253 chars), and OIDC subjects can be arbitrarily long.
+# Rather than use the raw value as the binding name, derive a DNS-safe slug
+# and append a short stable hash of the *original* value so distinct inputs
+# that collapse to the same slug (e.g. "Alice@x" vs "alice_x") still
+# produce distinct, collision-resistant binding names. The raw value is
+# still used unmodified as the RBAC subject (--serviceaccount=/--user=).
+define K8S_SAFE_NAME_PY
+import hashlib, re, sys
+prefix, raw = sys.argv[1], sys.argv[2]
+slug = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")[:32] or "x"
+digest = hashlib.sha256(raw.encode()).hexdigest()[:8]
+print(f"{prefix}-{slug}-{digest}")
+endef
+export K8S_SAFE_NAME_PY
+
+# WORKSPACE_NS/NAMESPACE are used as Kubernetes namespace names, which must
+# be a valid DNS-1123 label: lowercase alphanumeric or '-', starting and
+# ending with an alphanumeric character, max 63 characters. A character-set
+# only check (as previously used) still lets through values with leading or
+# trailing hyphens (e.g. "-ns" or "ns-") or over-length values, which the
+# Kubernetes API would reject anyway but only after invoking kubectl with a
+# less helpful error. Enforce the full label format up front instead.
+define K8S_DNS_LABEL_CHECK_PY
+import re, sys
+name, value = sys.argv[1], sys.argv[2]
+if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", value):
+    print(f"Error: {name} must be a valid Kubernetes namespace name (lowercase alphanumeric or '-', must start and end with an alphanumeric character, max 63 characters)", file=sys.stderr)
+    sys.exit(1)
+endef
+export K8S_DNS_LABEL_CHECK_PY
+
+grant-workspace-access: export _SA_USER := $(value SA_USER)
+grant-workspace-access: export _OIDC_USER := $(value OIDC_USER)
+grant-workspace-access: export _WORKSPACE_NS := $(value WORKSPACE_NS)
+grant-workspace-access: export _NAMESPACE := $(value NAMESPACE)
+grant-workspace-access:  ## Grant a user access to a specific workspace namespace  (SA_USER=alice OR OIDC_USER=alice, WORKSPACE_NS=my-project)
+	@test -n "$$_SA_USER$$_OIDC_USER" || (echo "Usage: make grant-workspace-access SA_USER=<name> WORKSPACE_NS=<ns>  (or OIDC_USER=<name> for OpenShift/OIDC users)" && exit 1)
+	@test -z "$$_SA_USER" -o -z "$$_OIDC_USER" || (echo "Error: specify only one of SA_USER or OIDC_USER, not both" && exit 1)
+	@test -n "$$_WORKSPACE_NS" || (echo "Usage: make grant-workspace-access SA_USER=<name>|OIDC_USER=<name> WORKSPACE_NS=<ns>" && exit 1)
+	@case "$$_SA_USER$$_OIDC_USER" in \
+	  *[!A-Za-z0-9._:@-]*) echo "Error: SA_USER/OIDC_USER may only contain letters, digits, and . _ - : @" >&2; exit 1 ;; \
+	esac
+	@python3 -c "$$K8S_DNS_LABEL_CHECK_PY" WORKSPACE_NS "$$_WORKSPACE_NS"
+	@python3 -c "$$K8S_DNS_LABEL_CHECK_PY" NAMESPACE "$$_NAMESPACE"
+	@if [ -n "$$_SA_USER" ]; then \
+	  _BIND_NAME=$$(python3 -c "$$K8S_SAFE_NAME_PY" swarmer-user "$$_SA_USER"); \
+	  kubectl create rolebinding "$$_BIND_NAME" \
+	    --clusterrole=swarmer-user \
+	    --serviceaccount="$$_NAMESPACE:$$_SA_USER" \
+	    --namespace="$$_WORKSPACE_NS" \
+	    --dry-run=client -o yaml | kubectl apply -f -; \
+	  echo "$$_SA_USER (ServiceAccount) can now access workspace namespace '$$_WORKSPACE_NS'."; \
+	else \
+	  _BIND_NAME=$$(python3 -c "$$K8S_SAFE_NAME_PY" swarmer-user "$$_OIDC_USER"); \
+	  kubectl create rolebinding "$$_BIND_NAME" \
+	    --clusterrole=swarmer-user \
+	    --user="$$_OIDC_USER" \
+	    --namespace="$$_WORKSPACE_NS" \
+	    --dry-run=client -o yaml | kubectl apply -f -; \
+	  echo "$$_OIDC_USER (OpenShift/OIDC User) can now access workspace namespace '$$_WORKSPACE_NS'."; \
+	fi
+
+grant-workspace-create: export _SA_USER := $(value SA_USER)
+grant-workspace-create: export _OIDC_USER := $(value OIDC_USER)
+grant-workspace-create: export _NAMESPACE := $(value NAMESPACE)
+grant-workspace-create:  ## Allow a user to create new workspaces  (SA_USER=alice OR OIDC_USER=alice)
+	@test -n "$$_SA_USER$$_OIDC_USER" || (echo "Usage: make grant-workspace-create SA_USER=<name>  (or OIDC_USER=<name> for OpenShift/OIDC users)" && exit 1)
+	@test -z "$$_SA_USER" -o -z "$$_OIDC_USER" || (echo "Error: specify only one of SA_USER or OIDC_USER, not both" && exit 1)
+	@case "$$_SA_USER$$_OIDC_USER" in \
+	  *[!A-Za-z0-9._:@-]*) echo "Error: SA_USER/OIDC_USER may only contain letters, digits, and . _ - : @" >&2; exit 1 ;; \
+	esac
+	@python3 -c "$$K8S_DNS_LABEL_CHECK_PY" NAMESPACE "$$_NAMESPACE"
+	@if [ -n "$$_SA_USER" ]; then \
+	  _BIND_NAME=$$(python3 -c "$$K8S_SAFE_NAME_PY" swarmer-workspace-creator "$$_SA_USER"); \
+	  kubectl create clusterrolebinding "$$_BIND_NAME" \
+	    --clusterrole=swarmer-workspace-creator \
+	    --serviceaccount="$$_NAMESPACE:$$_SA_USER" \
+	    --dry-run=client -o yaml | kubectl apply -f -; \
+	  echo "$$_SA_USER (ServiceAccount) can now create new workspaces (but cannot see others' workspaces without grant-workspace-access)."; \
+	else \
+	  _BIND_NAME=$$(python3 -c "$$K8S_SAFE_NAME_PY" swarmer-workspace-creator "$$_OIDC_USER"); \
+	  kubectl create clusterrolebinding "$$_BIND_NAME" \
+	    --clusterrole=swarmer-workspace-creator \
+	    --user="$$_OIDC_USER" \
+	    --dry-run=client -o yaml | kubectl apply -f -; \
+	  echo "$$_OIDC_USER (OpenShift/OIDC User) can now create new workspaces (but cannot see others' workspaces without grant-workspace-access)."; \
+	fi
 
 grant-workspace: grant-workspace-access  ## Deprecated alias for grant-workspace-access
 
@@ -165,7 +273,28 @@ deploy:  ## Deploy swarmer to the current kubectl context  (SILENT=1 for non-int
 	kubectl apply -f k8s/swarmer/rbac.yaml
 	kubectl apply -f k8s/swarmer/pvc.yaml
 	kubectl apply -f k8s/swarmer/configmap.yaml
+	@# ── 1.5 Resolve interactive deploy-time settings (persisted in .deploy-defaults) ──
+	@set -e; \
+	PREV_MAX=$$(grep '^MAX_CONCURRENT_AGENTS=' .deploy-defaults 2>/dev/null | cut -d= -f2 || true); \
+	DEF_MAX=$${PREV_MAX:-5}; \
+	MAX_VAL="$(MAX_CONCURRENT_AGENTS)"; \
+	if [ -z "$$MAX_VAL" ] && [ "$(SILENT)" != "1" ]; then \
+	  printf "MAX_CONCURRENT_AGENTS [$$DEF_MAX]: "; \
+	  read MAX_INPUT; \
+	  MAX_VAL=$${MAX_INPUT:-$$DEF_MAX}; \
+	else \
+	  MAX_VAL=$${MAX_VAL:-$$DEF_MAX}; \
+	fi; \
+	if ! echo "$$MAX_VAL" | grep -Eq '^[0-9]+$$'; then \
+	  echo "Error: MAX_CONCURRENT_AGENTS must be a number" >&2; \
+	  exit 1; \
+	fi; \
+	grep -v '^MAX_CONCURRENT_AGENTS=' .deploy-defaults 2>/dev/null > .deploy-defaults.tmp || true; \
+	echo "MAX_CONCURRENT_AGENTS=$$MAX_VAL" >> .deploy-defaults.tmp; \
+	mv .deploy-defaults.tmp .deploy-defaults
 	@# ── 2. OpenShell (install if not already present) ──────────────────────
+	@echo "$(OPENSHELL_WORKSPACE_STORAGE)" | grep -Eq '^[0-9]+(\.[0-9]+)?[EPTGMK]i?$$' || \
+	  (echo "Error: OPENSHELL_WORKSPACE_STORAGE must be a Kubernetes quantity (e.g. 10Gi)" >&2 && exit 1)
 	@set -e; \
 	HELM_VER=$$(helm version --short 2>/dev/null | grep -oP 'v\K[0-9]+\.[0-9]+' | head -1); \
 	HELM_MAJOR=$$(echo "$$HELM_VER" | cut -d. -f1); \
@@ -183,10 +312,15 @@ deploy:  ## Deploy swarmer to the current kubectl context  (SILENT=1 for non-int
 	    --version $(OPENSHELL_VERSION) \
 	    --namespace $(OPENSHELL_NAMESPACE) \
 	    --set server.auth.allowUnauthenticatedUsers=true \
+	    --set server.workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE) \
 	    --wait --timeout 5m; \
-	  echo "✓ OpenShell $(OPENSHELL_VERSION) installed."; \
+	  echo "✓ OpenShell $(OPENSHELL_VERSION) installed (workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE))."; \
 	else \
-	  echo "OpenShell already installed."; \
+	  echo "OpenShell already installed — version and workspaceDefaultStorageSize changes are"; \
+	  echo "  NOT applied automatically. To upgrade in place, run:"; \
+	  echo "  helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version $(OPENSHELL_VERSION) \\"; \
+	  echo "    -n $(OPENSHELL_NAMESPACE) --set server.auth.allowUnauthenticatedUsers=true \\"; \
+	  echo "    --set server.workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE) --wait"; \
 	fi; \
 	# Grant OpenShift SCCs required for sandbox pods (no-op on plain k8s / if oc is absent) \
 	if command -v oc > /dev/null 2>&1; then \
@@ -245,19 +379,8 @@ deploy:  ## Deploy swarmer to the current kubectl context  (SILENT=1 for non-int
 	  fi; \
 	fi; \
 	\
-	PREV_MAX=$$(grep '^MAX_CONCURRENT_AGENTS=' .deploy-defaults 2>/dev/null | cut -d= -f2 || true); \
-	DEF_MAX=$${PREV_MAX:-5}; \
-	MAX_VAL="$(MAX_CONCURRENT_AGENTS)"; \
-	if [ -z "$$MAX_VAL" ] && [ "$(SILENT)" != "1" ]; then \
-	  printf "MAX_CONCURRENT_AGENTS [$$DEF_MAX]: "; \
-	  read MAX_INPUT; \
-	  MAX_VAL=$${MAX_INPUT:-$$DEF_MAX}; \
-	else \
-	  MAX_VAL=$${MAX_VAL:-$$DEF_MAX}; \
-	fi; \
-	grep -v '^MAX_CONCURRENT_AGENTS=' .deploy-defaults 2>/dev/null > .deploy-defaults.tmp || true; \
-	echo "MAX_CONCURRENT_AGENTS=$$MAX_VAL" >> .deploy-defaults.tmp; \
-	mv .deploy-defaults.tmp .deploy-defaults; \
+	MAX_VAL=$$(grep '^MAX_CONCURRENT_AGENTS=' .deploy-defaults 2>/dev/null | cut -d= -f2); \
+	MAX_VAL=$${MAX_VAL:-5}; \
 	\
 	OPENSHELL_GW=$$(kubectl get svc openshell -n $(OPENSHELL_NAMESPACE) \
 	  -o jsonpath='{.metadata.name}.{.metadata.namespace}.svc.cluster.local:{.spec.ports[?(@.appProtocol=="grpc")].port}' \
