@@ -7,7 +7,7 @@ A FastAPI + HTMX dashboard for managing AI coding agent workloads on Kubernetes.
 ## Capabilities
 
 - **Workspaces** — each workspace maps 1:1 to a Kubernetes namespace; create, rename, and delete workspaces from the UI
-- **Secrets** — Fernet-encrypted storage for provider credentials (GCP/Vertex AI, Gemini, Anthropic, OpenAI), GitHub PATs for HTTPS git auth, and OCI registry pull secrets
+- **Secrets** — Gateway-only storage for Vertex AI ADC, Gemini, and OpenAI keys; Fernet-encrypted storage for GitHub PATs, GitHub App private keys, and MCP tokens
 - **Session lifecycle** — create → launch → monitor → stop → delete sessions backed by OpenShell sandboxes
 - **Three session modes:**
   - **Prompt** — one-shot: run a prompt, stream output, sandbox exits when done
@@ -18,6 +18,8 @@ A FastAPI + HTMX dashboard for managing AI coding agent workloads on Kubernetes.
 - **Dual output capture** — prompt-mode sessions preserve both the processed agent response (`last_output`) and the raw console log (`raw_output`); an Output / Raw Log toggle appears in the UI when they differ
 - **Agent tool support** — OpenCode (Go) coding agent, with pluggable tooling for future agents
 - **MCP server integration** — Model Context Protocol servers per workspace (e.g., Atlassian Jira)
+- **Agent Swarm MCP Server** — Standalone MCP server (`agent-swarm-mcp-server`) exposing full session, schedule, gateway, and workspace management tools for external AI agent orchestration
+- **API Token & MCP Setup** — Dedicated `/token` web dashboard view with 1-click token copying and `opencode.json` snippets, plus automated CLI configuration (`make mcp-setup` / `make api-info`)
 - **Prompt library** — workspace-level prompt library with git-backed folders and per-session picker
 - **Cron scheduling** — recurring prompt-mode sessions on a cron schedule
 - **REST API** — full `/api/v1/` REST API alongside the HTMX Console
@@ -57,7 +59,36 @@ See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full environment variable r
 
 ## Access Control
 
-> **These two commands are the primary way to onboard users and control workspace access.**
+Workspace access is a **database-backed ACL** (ACM-41659) — a workspace no longer maps to a
+dedicated Kubernetes namespace or RBAC grant. A user can see and manage a workspace if they are
+its owner (the user who created it), have been added as a member via the **Members** tab (or the
+`/api/v1/workspaces/{id}/members` API), or are a global admin (see below).
+
+**Upgrading from an older Swarmer version?** Nobody needs to be manually re-added. On first
+startup after upgrading, Swarmer automatically:
+- backfills `workspace_members` and each workspace's owner from existing per-user credential
+  records (AI provider credentials, GitHub PATs, MCP servers, GitHub Apps) already in the database;
+- mirrors any legacy `make grant-workspace-access` K8s RoleBinding grants into the same table
+  (best-effort — skipped if K8s is unreachable, never blocks startup);
+- for shared-namespace deployments (`K8S_NAMESPACE` set), every authenticated user keeps access to
+  every workspace, matching that deployment flavor's original flat trust model.
+
+A workspace that genuinely has no recoverable owner (e.g. it was created but never used) stays
+open to any authenticated user — the first person to rename it, delete it, or add/remove a member
+automatically becomes its owner.
+
+### Global Admins — simple setup
+
+Global admins can see and manage every workspace. There are two ways to grant admin rights,
+and you can mix both:
+
+- **Self-service (recommended for day-to-day use):** the very first user to log in sees a
+  **"Become the first Admin"** button on the Workspaces page (or `/admins`) — one click, zero
+  configuration. Once at least one admin exists, admins manage the rest from the `/admins` page
+  (or `POST`/`DELETE /api/v1/admins`).
+- **Declarative (for GitOps-managed deployments):** set `WORKSPACE_ADMIN_USERS`
+  (comma-separated K8s usernames) and/or `WORKSPACE_ADMIN_GROUPS` (comma-separated groups)
+  in the deployment environment. These always take effect and don't need the bootstrap step.
 
 ### Issue a login token
 
@@ -68,55 +99,53 @@ make user-token SA_USER=alice
 make user-token SA_USER=alice TOKEN_DURATION=24h   # default: 8h
 ```
 
-Share the printed token with the user — it expires after `TOKEN_DURATION`.
+Share the printed token with the user — it expires after `TOKEN_DURATION`. (Users authenticating
+via OpenShift OAuth / OIDC don't need this step — they log in through the OAuth flow instead.)
 
 ### Grant workspace access
 
-Binds a user to a specific workspace namespace so they can see and manage sessions in it:
+Self-service — no `kubectl` or cluster access required. Open the workspace, go to the **Members**
+tab, and add the user's exact K8s username (`system:serviceaccount:<ns>:<name>` for a ServiceAccount
+token, or their OpenShift OAuth/OIDC username). The username field suggests candidates from people
+you already share a workspace with (global admins see every known username), plus every OpenShift
+`User` and every ServiceAccount `make user-token SA_USER=<name>` would create — but it's always
+still a free-text field, so you can invite someone who hasn't logged in yet. Only the workspace
+owner or a configured admin can add or remove members. This can also be done via the API:
 
 ```sh
-make grant-workspace-access SA_USER=alice WORKSPACE_NS=my-project
-```
-
-Run this once per user per namespace. A user with no workspace grants can log in but will see no workspaces.
-
-Use `OIDC_USER=` instead of `SA_USER=` for users who log in via OpenShift OAuth / OIDC
-(e.g. GitHub identity provider) rather than a Kubernetes ServiceAccount token — these
-are different Kubernetes RBAC principals (`User` vs `ServiceAccount`) and a binding for
-one does not grant access for the other:
-
-```sh
-make grant-workspace-access OIDC_USER=<name> WORKSPACE_NS=my-project
+curl -sX POST "$SWARMER_URL/api/v1/workspaces/<id>/members" \
+  -H "Authorization: Bearer <owner-or-admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "alice"}'
 ```
 
 ### Allow a user to create new workspaces
 
-Grants cluster-scoped `create namespaces` permission so the user sees the **Create Workspace** button.
-Users can only see workspaces they have been explicitly granted access to — this does not expose other users' workspaces:
-
-```sh
-make grant-workspace-create SA_USER=<name>
-make grant-workspace-create OIDC_USER=<name>   # for OpenShift OAuth / OIDC users
-```
+By default (`WORKSPACE_CREATE_POLICY=all`), any authenticated user can create a workspace
+and becomes its owner. To restrict workspace creation to admins, set
+`WORKSPACE_CREATE_POLICY=admins` and list admins via `WORKSPACE_ADMIN_USERS`
+(comma-separated K8s usernames) and/or `WORKSPACE_ADMIN_GROUPS` (comma-separated groups)
+in the deployment environment.
 
 ### Typical onboarding flow
 
 ```sh
-make user-token SA_USER=alice                                  # 1. create user + print token
-make grant-workspace-access SA_USER=alice WORKSPACE_NS=team-a  # 2. give access to a workspace
-make grant-workspace-access SA_USER=alice WORKSPACE_NS=team-b  # 3. repeat for additional workspaces
-# Optionally allow the user to create their own workspaces:
-make grant-workspace-create SA_USER=alice                      # 4. allow self-service workspace creation
+make user-token SA_USER=alice   # 1. create user + print token, share with alice
+# 2. alice logs in and either creates her own workspace, or an existing
+#    workspace owner adds her via the Members tab / API above.
 ```
 
-For users authenticating via OpenShift OAuth / OIDC instead of a token-based ServiceAccount,
-substitute `OIDC_USER=<name>` for `SA_USER=<name>` in the `grant-workspace-access` and
-`grant-workspace-create` steps above (skip `make user-token`, since OIDC users don't need one).
+> Deprecated: `make grant-workspace-access` / `make grant-workspace-create` (Kubernetes namespace
+> RoleBindings) are kept only as legacy no-op-equivalent commands for existing automation — Swarmer
+> no longer consults K8s RBAC for workspace authorization. Use the Members tab / admin env vars above.
 
 ## Other useful targets
 
 ```sh
-make help          # list all Makefile targets
-make lint          # run ruff linter
-make db-reset      # delete the SQLite database (fresh schema on next start)
+make help                      # list all Makefile targets
+make lint                      # run ruff linter
+make test                      # run unit tests and mcp-server test suite
+make mcp-setup                 # configure local opencode.json for Agent Swarm
+make api-info                  # display Swarmer API URL, current user, and MCP config snippet
+make db-reset                  # delete the SQLite database (fresh schema on next start)
 ```

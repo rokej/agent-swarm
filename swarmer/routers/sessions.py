@@ -4,6 +4,7 @@ import logging
 import re
 import shlex
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 
 import httpx
@@ -29,12 +30,38 @@ from swarmer.github import list_repos_for_github_app as _list_repos_for_github_a
 from swarmer.github_url_validator import GitHubURLError, validate_github_url
 from swarmer.models.github_pat import GitHubPAT
 from swarmer.models.opencode_secret import OpencodeSecret
-from swarmer.models.session import CRON_PRESETS, DEFAULT_EPHEMERAL_DISK, EPHEMERAL_DISK_OPTIONS, Session
+from swarmer.models.session import CRON_PRESETS, Session
 from swarmer.models.session_repo import SessionRepo
+from swarmer.models.session_schedule import AUTHOR_SCOPES, EVENT_CONDITIONS
 from swarmer.models.workspace import Workspace
 from swarmer.models.workspace_prompt import WorkspacePrompt, WorkspacePromptSource
 
 log = logging.getLogger(__name__)
+_CLIENT_UNSET = object()
+
+# ── Security model overview ───────────────────────────────────────────────────
+#
+# Authentication:
+#   Every route uses Depends(require_auth), which checks that the request
+#   carries a valid authenticated session cookie set during the login flow.
+#   The login flow validates the user's Kubernetes bearer token via the K8s
+#   TokenReview API (swarmer/k8s_auth.py), so only users with a valid cluster
+#   identity can authenticate.  The REST API (swarmer/api/) uses
+#   require_api_auth which validates the bearer token on every request.
+#
+# Workspace isolation:
+#   Workspaces map 1:1 to Kubernetes namespaces.  Every session operation
+#   checks that the requested session belongs to the workspace in the URL
+#   (session.workspace_id == ws_id); mismatches are rejected.  The REST API
+#   additionally enforces K8s namespace RBAC via user_can_access_workspace().
+#
+# Shell command trust boundary:
+#   For shell-tool sessions, instruction_prompt is executed verbatim inside a
+#   sandboxed container.  Input is not sanitised — the sandbox (Landlock
+#   filesystem policy, OPA network policy, process isolation) is the security
+#   boundary.  See the inline "Security note" comment at the sh -c call site.
+#
+# ─────────────────────────────────────────────────────────────────────────────
 
 _INVALID_REF_RE = re.compile(
     r"[\x00-\x1f\x7f ~^:?*\[\\]"
@@ -44,6 +71,94 @@ _INVALID_REF_RE = re.compile(
     r"|\.lock$"
     r"|//"
 )
+
+# Patterns for common secret material that should not be persisted verbatim in
+# session output.  Applied only to shell-tool output, where the raw command's
+# stdout/stderr is stored directly (unlike AI-tool output, which is filtered
+# through OpenCode's response pipeline).
+#
+# _SECRET_KEY_RE targets key=value, KEY: value, or JSON-style credential
+# assignments where the key is a known credential name.  The value minimum is
+# intentionally 1 char so short passwords (e.g. PASSWORD=abc) are still
+# redacted.  The key name may be wrapped in quotes (JSON/YAML "api_key": ...)
+# and the value may be quoted (API_KEY="...") — only the value is replaced,
+# preserving surrounding syntax.
+#
+# _EMAIL_RE separately redacts email addresses that appear after known PII key
+# names (e.g. JIRA_EMAIL=user@example.com), since the @ and domain chars fall
+# outside the opaque-token character class used by _SECRET_KEY_RE.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)"                                         # case-insensitive
+    r"(?P<prefix>"
+    r"[\"']?"                                       # optional JSON/YAML key quote
+    r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer|password|passwd|secret|"
+    r"private[_-]?key|gh_token|github_token|google_api_key|jira_access_token|"
+    r"jira_api_token|openai_api_key|anthropic_api_key|slack_token|slack_webhook|"
+    r"aws_secret_access_key|aws_session_token|service_account_key"
+    r")"
+    r"[\"']?\s*[=:]\s*"                             # optional key quote + separator
+    r"(?P<q>[\"']?)"                                # optional value quote
+    r")"
+    r"(?:[^\"'\s]+)"                                # opaque value (1+ non-quote/space chars)
+    r"(?P<q2>(?P=q))",                              # matching closing value quote
+)
+_EMAIL_RE = re.compile(
+    r"(?i)"
+    r"(?P<prefix>"
+    r"[\"']?"                                       # optional JSON/YAML key quote
+    r"(?:\w+[_-])?email(?:[_-]\w+)?"               # *_email, email_*, or just email
+    r"[\"']?\s*[=:]\s*"
+    r"(?P<q>[\"']?)"                                # optional value quote
+    r")"
+    r"(?:[^\s,}\"']{1,}@[^\s,}\"']+)"              # user@domain (any chars except delimiters)
+    r"(?P<q2>(?P=q))",
+)
+_REDACTED = "[REDACTED]"
+
+
+def _redact_secrets(
+    text: str,
+    secret_values: Iterable[str] | None = None,
+) -> str:
+    """Replace likely secret values in *text* with ``[REDACTED]``.
+
+    Applied to shell-tool stdout/stderr before it is written to the DB so that
+    accidental ``printenv``, ``env``, or credential-echoing scripts don't
+    persist secrets in plaintext in the session output columns.
+
+    The redaction is best-effort and multi-layered:
+
+    1. Any non-empty literal secret strings provided in *secret_values*
+       (e.g., injected GitHub PAT tokens, Jira tokens, workspace env vars)
+       are replaced directly with ``[REDACTED]``.
+    2. Key-based regex pattern matching targets common credential key names
+       (TOKEN, API_KEY, PASSWORD, etc.) followed by an ``=`` or ``:`` assignment,
+       including quoted values (``API_KEY="..."``) and JSON-style key/value pairs
+       (``"api_key": "..."``).  Values of any length are redacted so short
+       passwords (e.g. ``PASSWORD=abc``) are covered.
+    3. Email addresses following PII key names (e.g. ``JIRA_EMAIL=u@example.com``).
+
+    Legitimate log lines are not affected as long as they don't look like
+    key=value credential or PII assignments.
+    """
+    if not text:
+        return text
+
+    if secret_values:
+        valid_secrets = sorted(
+            {s for s in secret_values if s and isinstance(s, str) and s.strip()},
+            key=len,
+            reverse=True,
+        )
+        for sec in valid_secrets:
+            text = text.replace(sec, _REDACTED)
+
+    text = _SECRET_KEY_RE.sub(
+        lambda m: m.group("prefix") + _REDACTED + m.group("q2"), text
+    )
+    return _EMAIL_RE.sub(
+        lambda m: m.group("prefix") + _REDACTED + m.group("q2"), text
+    )
 
 
 def _is_valid_ref_name(name: str) -> bool:
@@ -97,7 +212,11 @@ def _github_app_provider_name(workspace_id: int, session_id: int) -> str:
     return f"swarmer-ws-{workspace_id}-github-app-s{session_id}"
 
 
-async def _delete_github_app_provider(workspace_id: int, session_id: int) -> None:
+async def _delete_github_app_provider(
+    workspace_id: int,
+    session_id: int,
+    client=_CLIENT_UNSET,
+) -> None:
     """Delete the session-scoped GitHub App provider from the OpenShell Gateway.
 
     Safe to call even when no GitHub App was used — delete_provider is a no-op
@@ -115,13 +234,24 @@ async def _delete_github_app_provider(workspace_id: int, session_id: int) -> Non
             log.info("_delete_github_app_provider: cancelled iat-refresh task for session %d", session_id)
             break
     try:
-        await openshell_client.delete_provider(pname)
+        oc_client = client
+        if oc_client is _CLIENT_UNSET:
+            oc_client = await openshell_client.get_client_for_workspace(workspace_id)
+        if oc_client is not None:
+            await openshell_client.delete_provider(pname, client=oc_client)
+        else:
+            await openshell_client.delete_provider(pname)
         log.info("_delete_github_app_provider: deleted provider %s", pname)
     except Exception:
         log.warning("_delete_github_app_provider: failed to delete provider %s", pname, exc_info=True)
 
 
-async def _delete_pat_provider(workspace_id: int, pat_id: int | None, session_id: int | None = None) -> None:
+async def _delete_pat_provider(
+    workspace_id: int,
+    pat_id: int | None,
+    session_id: int | None = None,
+    client=_CLIENT_UNSET,
+) -> None:
     """Delete the session-scoped PAT provider from the OpenShell Gateway.
 
     Safe to call when pat_id is None (no PAT was used) — returns immediately.
@@ -132,11 +262,29 @@ async def _delete_pat_provider(workspace_id: int, pat_id: int | None, session_id
         return
     from swarmer import openshell_client
 
+    oc_client = client
+    if oc_client is _CLIENT_UNSET:
+        try:
+            oc_client = await openshell_client.get_client_for_workspace(workspace_id)
+        except Exception:
+            # Do not fall back to the default gateway when the workspace has a
+            # dedicated gateway but credential/client resolution fails. Also do not
+            # bubble this cleanup failure into run-state transitions.
+            log.warning(
+                "_delete_pat_provider: unable to resolve workspace gateway client for ws %d",
+                workspace_id,
+                exc_info=True,
+            )
+            return
+
     # Session-scoped name (current format).
     if session_id:
         pname = f"swarmer-ws-{workspace_id}-github-pat-{pat_id}-s{session_id}"
         try:
-            await openshell_client.delete_provider(pname)
+            if oc_client is not None:
+                await openshell_client.delete_provider(pname, client=oc_client)
+            else:
+                await openshell_client.delete_provider(pname)
             log.info("_delete_pat_provider: deleted provider %s", pname)
         except Exception:
             log.warning("_delete_pat_provider: failed to delete provider %s", pname, exc_info=True)
@@ -144,7 +292,10 @@ async def _delete_pat_provider(workspace_id: int, pat_id: int | None, session_id
     # Legacy workspace-scoped name — clean up if still present.
     legacy_pname = f"swarmer-ws-{workspace_id}-github-pat-{pat_id}"
     try:
-        await openshell_client.delete_provider(legacy_pname)
+        if oc_client is not None:
+            await openshell_client.delete_provider(legacy_pname, client=oc_client)
+        else:
+            await openshell_client.delete_provider(legacy_pname)
         log.info("_delete_pat_provider: deleted legacy provider %s", legacy_pname)
     except Exception:
         log.warning("_delete_pat_provider: failed to delete legacy provider %s", legacy_pname, exc_info=True)
@@ -195,14 +346,31 @@ async def _get_provider_options(
     oc = result.scalars().first()
     # Check gateway for Vertex AI provider — ADC is stored on OpenShell, not Swarmer DB.
     has_vertex = False
+    has_gemini = False
     try:
         from swarmer import openshell_client
-        has_vertex = await openshell_client.provider_exists(f"swarmer-ws-{ws_id}-google-cloud")
+        oc_client = await openshell_client.get_client_for_workspace(ws_id, db)
+        has_vertex = await openshell_client.provider_exists(
+            f"swarmer-ws-{ws_id}-google-cloud", client=oc_client
+        )
+        has_gemini = await openshell_client.provider_exists(
+            f"swarmer-ws-{ws_id}-google-ai-studio", client=oc_client
+        )
     except Exception:
         pass
-    # Google AI Studio key still lives encrypted in the DB pending ACM-37263.
-    has_gemini = bool(oc and oc.google_api_key_enc)
-    return tool.get_model_options(oc, has_vertex=has_vertex, has_gemini=has_gemini)
+    # Check gateway for OpenAI provider — key is stored on OpenShell, not Swarmer DB.
+    has_openai = False
+    try:
+        from swarmer import openshell_client
+        has_openai = await openshell_client.provider_exists(f"swarmer-ws-{ws_id}-openai")
+    except Exception:
+        pass
+    return tool.get_model_options(
+        oc,
+        has_vertex=has_vertex,
+        has_gemini=has_gemini,
+        has_openai=has_openai,
+    )
 
 router = APIRouter()
 templates = Jinja2Templates(directory="swarmer/templates")
@@ -311,6 +479,8 @@ async def session_list(
 
     sessions = await _list_sessions_data(ws_id, db)
     await _sync_session_phases(sessions, ws, db)
+    from swarmer.provider_status import get_missing_provider_names
+    missing_ai_providers = await get_missing_provider_names(ws_id, db)
 
     _tools = all_tools()
     _avail = await asyncio.gather(
@@ -325,6 +495,7 @@ async def session_list(
             "mode_label": _session_mode_label,
             "mode_badge": _session_mode_badge_class,
             "tool_image_available": dict(zip([t.name for t in _tools], _avail, strict=False)),
+            "missing_ai_providers": missing_ai_providers,
         },
     )
 
@@ -343,6 +514,8 @@ async def session_list_rows(
 
     sessions = await _list_sessions_data(ws_id, db)
     await _sync_session_phases(sessions, ws, db)
+    from swarmer.provider_status import get_missing_provider_names
+    missing_ai_providers = await get_missing_provider_names(ws_id, db)
 
     _tools = all_tools()
     _avail = await asyncio.gather(
@@ -367,6 +540,7 @@ async def session_list_rows(
             "tool_image_available": dict(zip([t.name for t in _tools], _avail, strict=False)),
             "queue_positions": queue_positions,
             "capacity": capacity,
+            "missing_ai_providers": missing_ai_providers,
         },
     )
 
@@ -395,12 +569,15 @@ async def session_new(
     from swarmer.routers.mcp_servers import get_enabled_mcp_servers
     mcp_servers = await get_enabled_mcp_servers(ws_id, db, user_id=_current_user(request))
     prompt_sources = await _get_prompt_sources(ws_id, db)
+    from swarmer.github_app import get_workspace_github_app
+    _ws_github_app = await get_workspace_github_app(ws_id, db, user_id=_current_user(request))
     return templates.TemplateResponse(
         request,
         "sessions/new.html",
         {
             "ws": ws,
             "pats": pats,
+            "has_github_app": bool(_ws_github_app),
             "provider_options": provider_options,
             "selected_provider": "",
             "agent_tools": _tools,
@@ -408,8 +585,6 @@ async def session_new(
             "tool_image_available": dict(zip([t.name for t in _tools], _avail, strict=False)),
             "mcp_servers": mcp_servers,
             "prompt_sources": prompt_sources,
-            "ephemeral_disk_options": EPHEMERAL_DISK_OPTIONS,
-            "default_ephemeral_disk": DEFAULT_EPHEMERAL_DISK,
         },
     )
 
@@ -425,7 +600,6 @@ async def session_create(
     provider: str = Form(""),
     agent_tool: str = Form("opencode"),
     working_branch: str = Form(""),
-    ephemeral_disk: str = Form(DEFAULT_EPHEMERAL_DISK),
     db: AsyncSession = Depends(get_db),
 ):
     ws = await _get_workspace(ws_id, db)
@@ -475,9 +649,6 @@ async def session_create(
         flash(request, "Invalid working branch name.", "danger")
         return RedirectResponse(url=f"/workspaces/{ws_id}/sessions/new", status_code=302)
 
-    if ephemeral_disk not in EPHEMERAL_DISK_OPTIONS:
-        ephemeral_disk = DEFAULT_EPHEMERAL_DISK
-
     session = Session(
         workspace_id=ws_id,
         github_pat_id=pat_id,
@@ -487,7 +658,6 @@ async def session_create(
         instruction_prompt=instruction_prompt.strip(),
         agent_tool=agent_tool,
         working_branch=wb,
-        ephemeral_disk=ephemeral_disk,
     )
     # Gather MCP server checkbox selections from the multi-value form field
     form_data = await request.form()
@@ -522,14 +692,25 @@ async def session_create(
         from swarmer.routers.mcp_servers import get_enabled_mcp_servers
         mcp_servers = await get_enabled_mcp_servers(ws_id, db, user_id=_current_user(request))
         prompt_sources = await _get_prompt_sources(ws_id, db)
+        from swarmer.github_app import get_workspace_github_app
+        _ws_github_app = await get_workspace_github_app(ws_id, db, user_id=_current_user(request))
         return templates.TemplateResponse(
             request,
             "sessions/new.html",
             {
                 "ws": ws,
                 "pats": pats,
+                "has_github_app": bool(_ws_github_app),
                 "error": f"A session named '{name}' already exists in this workspace.",
-                "form": {"name": name, "instruction_prompt": instruction_prompt, "working_branch": wb, "ephemeral_disk": ephemeral_disk},
+                "form": {
+                    "name": name,
+                    "instruction_prompt": instruction_prompt,
+                    "working_branch": wb,
+                    "agent_tool": agent_tool,
+                    "github_pat_id": github_pat_id,
+                    "prompt_id": prompt_id,
+                    "mcp_server_ids": selected_mcp_ids,
+                },
                 "provider_options": provider_options,
                 "selected_provider": provider,
                 "agent_tools": _tools,
@@ -537,8 +718,6 @@ async def session_create(
                 "tool_image_available": dict(zip([t.name for t in _tools], _avail, strict=False)),
                 "mcp_servers": mcp_servers,
                 "prompt_sources": prompt_sources,
-                "ephemeral_disk_options": EPHEMERAL_DISK_OPTIONS,
-                "default_ephemeral_disk": DEFAULT_EPHEMERAL_DISK,
             },
             status_code=422,
         )
@@ -650,7 +829,8 @@ async def session_detail(
                 or session.custom_policies
             ),
             "schedules": session.schedules or [],
-            "ephemeral_disk_options": EPHEMERAL_DISK_OPTIONS,
+            "event_conditions": EVENT_CONDITIONS,
+            "author_scopes": AUTHOR_SCOPES,
         },
     )
 
@@ -715,9 +895,18 @@ async def session_edit(
         session.mode = mode
     session.provider = provider.strip()
     try:
-        session.agent_tool = get_tool(agent_tool).name
+        _new_agent_tool = get_tool(agent_tool).name
     except ValueError:
-        pass
+        _new_agent_tool = session.agent_tool
+
+    # Some agent tools don't support server mode (e.g. shell). The UI hides/disables
+    # this combination, but reject it server-side too in case of a direct request.
+    _new_tool_strategy = get_tool(_new_agent_tool)
+    if not _new_tool_strategy.supports_server_mode() and session.mode == "server":
+        flash(request, f"{_new_tool_strategy.display_name} agent tool does not support server mode.", "danger")
+        return RedirectResponse(url=f"/workspaces/{ws_id}/sessions/{sid}", status_code=302)
+
+    session.agent_tool = _new_agent_tool
 
     form_data = await request.form()
     if "working_branch" in form_data:
@@ -726,11 +915,6 @@ async def session_edit(
             flash(request, "Invalid working branch name.", "danger")
             return RedirectResponse(url=f"/workspaces/{ws_id}/sessions/{sid}", status_code=302)
         session.working_branch = branch_val
-
-    if "ephemeral_disk" in form_data:
-        disk_val = str(form_data["ephemeral_disk"]).strip()
-        if disk_val in EPHEMERAL_DISK_OPTIONS:
-            session.ephemeral_disk = disk_val
 
     selected_mcp_ids = [int(v) for v in form_data.getlist("mcp_server_ids") if str(v).isdigit()]
     if selected_mcp_ids:
@@ -874,6 +1058,8 @@ def _build_expected_hosts(model: str, repos_data: list[dict], tool_name: str, mo
 
 async def _resolve_schedule_prompt(schedule_id: int, session: Session, db: AsyncSession) -> str:
     """Resolve a per-schedule prompt, falling back to session defaults for empty fields."""
+    import json as _json
+
     from swarmer.models.session_schedule import SessionSchedule
     sched = await db.get(SessionSchedule, schedule_id)
     if sched is None:
@@ -895,11 +1081,37 @@ async def _resolve_schedule_prompt(schedule_id: int, session: Session, db: Async
     )
 
     if effective_instruction and base_prompt:
-        return effective_instruction + "\n\n" + base_prompt
+        resolved_prompt = effective_instruction + "\n\n" + base_prompt
     elif effective_instruction:
-        return effective_instruction
+        resolved_prompt = effective_instruction
     else:
-        return base_prompt
+        resolved_prompt = base_prompt
+
+    if sched.trigger_type == "event" and sched.include_event_context and session.event_context:
+        try:
+            event_context = _json.dumps(
+                _json.loads(session.event_context), indent=2, sort_keys=True
+            )
+        except (TypeError, ValueError):
+            event_context = session.event_context
+        resolved_prompt += (
+            "\n\n## GitHub Event Context\n"
+            "The following event data identifies the event that triggered this run:\n"
+            "```json\n"
+            f"{event_context}\n"
+            "```"
+        )
+
+    return resolved_prompt
+
+
+async def _resolve_schedule_provider(schedule_id: int, session: Session, db: AsyncSession) -> str:
+    """Return a schedule provider override, or the session provider."""
+    from swarmer.models.session_schedule import SessionSchedule
+    sched = await db.get(SessionSchedule, schedule_id)
+    if sched and sched.provider.strip():
+        return sched.provider.strip()
+    return (session.provider or "").strip()
 
 
 async def _do_launch(session: Session, ws: Workspace, db: AsyncSession, user_id: str = "") -> None:
@@ -984,6 +1196,11 @@ async def _do_launch(session: Session, ws: Workspace, db: AsyncSession, user_id:
     else:
         resolved_prompt = await _resolve_session_prompt(session, db)
 
+    if session.active_schedule_id:
+        session_provider = await _resolve_schedule_provider(session.active_schedule_id, session, db)
+    else:
+        session_provider = (session.provider or "").strip()
+
     # Fetch workspace prompt sources for network policy scoping.
     # Agents inside the sandbox may curl raw.githubusercontent.com to fetch
     # prompt documents or files referenced by the prompt.  The policy is
@@ -1001,6 +1218,7 @@ async def _do_launch(session: Session, ws: Workspace, db: AsyncSession, user_id:
         resolved_prompt=resolved_prompt,
         prompt_sources=prompt_sources,
         user_id=user_id,
+        requested_provider=session_provider,
     )
 
 
@@ -1015,32 +1233,72 @@ async def _do_launch_openshell(
     resolved_prompt: str,
     prompt_sources: list | None = None,
     user_id: str = "",
+    requested_provider: str = "",
 ) -> None:
     """Launch a session via the OpenShell sandbox API."""
     from swarmer import openshell_client
-    from swarmer.openshell_policy import build_session_policy
+    from swarmer.openshell_policy import build_session_policy, slack_webhook_enabled
 
     tool = get_tool(session.agent_tool)
 
     # Resolve the provider first so it is available for provider registration and
-    # policy building. session.provider is a family preset name ("claude"/"gemini",
+    # policy building. session.provider is a family preset name ("claude"/"gemini"/"openai",
     # ACM-37232) — build_config_data() understands it directly. Everything else
     # (network policy, CLI --model flag, model.json state) needs a concrete model
     # ID, so it uses `model` — the provider resolved to its BUILD-role model —
     # instead. Raw provider/model@version strings from pre-ACM-37232 sessions are
     # also still accepted for backward compatibility.
-    if session.provider and tool.is_valid_model(session.provider):
-        raw_model = session.provider
+    # The schedule/session value is only a preference. Credentials can be removed
+    # after it was saved, so resolve it against live gateway providers below.
+    _provider_names = {
+        "claude": f"swarmer-ws-{session.workspace_id}-google-cloud",
+        "gemini": f"swarmer-ws-{session.workspace_id}-google-ai-studio",
+        "openai": f"swarmer-ws-{session.workspace_id}-openai",
+    }
+    _available_providers: dict[str, bool] = {}
+    oc_client = await openshell_client.get_client_for_workspace(ws, db)
+    if tool.requires_ai_model():
+        for _name, _gateway_name in _provider_names.items():
+            try:
+                _available_providers[_name] = await openshell_client.provider_exists(
+                    _gateway_name, client=oc_client
+                )
+            except Exception:
+                _available_providers[_name] = False
+    _preferred_provider = requested_provider if requested_provider in _provider_names else ""
+    _preferred_raw_model = ""
+    if not _preferred_provider and requested_provider and "/" in requested_provider:
+        _raw_provider = requested_provider.split("/", 1)[0]
+        _raw_provider_family = {
+            "google-vertex-anthropic": "claude",
+            "google": "gemini",
+            "openai": "openai",
+        }.get(_raw_provider, "")
+        if _raw_provider_family and tool.is_valid_model(requested_provider):
+            _preferred_provider = _raw_provider_family
+            _preferred_raw_model = requested_provider
+    if _preferred_provider and _available_providers.get(_preferred_provider):
+        raw_model = _preferred_raw_model or _preferred_provider
         log.info(
-            "_do_launch_openshell: session %d using stored provider %r (tool=%s)",
+            "_do_launch_openshell: session %d using provider %r (tool=%s)",
             session.id, raw_model, tool.name,
         )
-    else:
-        raw_model = tool.get_default_model(has_adc)
+    elif requested_provider in _provider_names:
+        # Keep an explicit preset so provider-specific validation below can
+        # return an actionable error instead of silently changing models.
+        raw_model = requested_provider
         log.info(
-            "_do_launch_openshell: session %d stored provider %r invalid/empty — "
-            "falling back to default %r (tool=%s, has_adc=%s)",
-            session.id, session.provider, raw_model, tool.name, has_adc,
+            "_do_launch_openshell: session %d requested provider %r is unavailable",
+            session.id, requested_provider,
+        )
+    else:
+        _fallback = next((p for p in ("claude", "gemini", "openai") if _available_providers.get(p)), "")
+        if tool.requires_ai_model() and not _fallback:
+            raise ValueError("No AI provider is configured for this workspace")
+        raw_model = _fallback or tool.get_default_model(has_adc)
+        log.info(
+            "_do_launch_openshell: session %d provider %r unavailable — falling back to %r",
+            session.id, requested_provider, raw_model,
         )
     raw_model = raw_model.strip("\r\n")  # strip any stray line endings before embedding in shell commands
     model = tool.resolve_build_model(raw_model)
@@ -1105,6 +1363,7 @@ async def _do_launch_openshell(
         github_pat=session.github_pat,
         mcp_servers=mcp_servers or [],
         extra_env=extra_env,
+        client=oc_client,
     )
     # Point OpenCode at the config file written by write_agent_config() via the
     # OPENCODE_CONFIG env var (there is no --config CLI flag).
@@ -1122,26 +1381,53 @@ async def _do_launch_openshell(
     #     the injected env vars (GOOGLE_API_KEY, ANTHROPIC_API_KEY, GH_TOKEN, etc.).
     provider_names: list[str] = []
     ws_id = session.workspace_id
-    if oc_secret and oc_secret.google_api_key:
-        pname = f"swarmer-ws-{ws_id}-google-ai-studio"
-        await openshell_client.ensure_provider(pname, "google-ai-studio", {}, credentials={
-                "GOOGLE_API_KEY": oc_secret.google_api_key,
-                "GOOGLE_GENERATIVE_AI_API_KEY": oc_secret.google_api_key,
-            })
-        provider_names.append(pname)
+    # Google AI Studio (Gemini) via google-ai-studio provider — key is stored on the
+    # gateway (not in Swarmer DB, ACM-37263). Attach the provider if it already
+    # exists (created via the secrets UI at save time), mirroring the Vertex pattern.
+    # Non-AI tools (e.g. shell) never call an AI model — skip AI provider
+    # credentials (Google AI Studio, Vertex/google-cloud) for their sandboxes.
+    _gemini_pname = f"swarmer-ws-{ws_id}-google-ai-studio"
+    if tool.requires_ai_model():
+        try:
+            if await openshell_client.provider_exists(_gemini_pname, client=oc_client):
+                provider_names.append(_gemini_pname)
+        except Exception:
+            log.warning(
+                "_do_launch_openshell: could not check google-ai-studio provider for session %d",
+                session.id, exc_info=True,
+            )
+    # OpenAI provider — key is stored on the gateway (not in Swarmer DB).
+    # Only required for OpenAI model sessions.
+    _openai_pname = f"swarmer-ws-{ws_id}-openai"
+    if tool.requires_ai_model() and model.split("/", 1)[0] == "openai":
+        try:
+            has_openai_provider = await openshell_client.provider_exists(
+                _openai_pname, client=oc_client
+            )
+        except Exception:
+            log.warning(
+                "_do_launch_openshell: could not check openai provider for session %d",
+                session.id,
+                exc_info=True,
+            )
+            raise ValueError("Could not verify OpenAI API key configuration for this workspace")
+        if not has_openai_provider:
+            raise ValueError("OpenAI API key is not configured for this workspace")
+        provider_names.append(_openai_pname)
     # Vertex AI via google-cloud provider — ADC is stored on the gateway (not in Swarmer DB).
     # Attach the provider if it already exists (created via the secrets UI).
     _vertex_pname = f"swarmer-ws-{ws_id}-google-cloud"
     _has_google_cloud_provider = False
-    try:
-        if await openshell_client.provider_exists(_vertex_pname):
-            provider_names.append(_vertex_pname)
-            _has_google_cloud_provider = True
-    except Exception:
-        log.warning(
-            "_do_launch_openshell: could not check google-cloud provider for session %d",
-            session.id, exc_info=True,
-        )
+    if tool.requires_ai_model():
+        try:
+            if await openshell_client.provider_exists(_vertex_pname, client=oc_client):
+                provider_names.append(_vertex_pname)
+                _has_google_cloud_provider = True
+        except Exception:
+            log.warning(
+                "_do_launch_openshell: could not check google-cloud provider for session %d",
+                session.id, exc_info=True,
+            )
     # 1b cont. GitHub App IAT — minted above before commit; now register the provider.
     _app_pname: str | None = None
 
@@ -1156,7 +1442,7 @@ async def _do_launch_openshell(
             await openshell_client.ensure_provider(pname, "github", {}, credentials={
                 "GITHUB_TOKEN": iat,
                 "GH_TOKEN": iat,
-            })
+            }, client=oc_client)
             provider_names.append(pname)
             _app_pname = pname
             log.info(
@@ -1177,7 +1463,7 @@ async def _do_launch_openshell(
         await openshell_client.ensure_provider(pname, "github", {}, credentials={
             "GITHUB_TOKEN": pat_token,
             "GH_TOKEN": pat_token,
-        })
+        }, client=oc_client)
         provider_names.append(pname)
     for mcp in (mcp_servers or []):
         if "jira" in getattr(mcp, "slug", "") and getattr(mcp, "jira_access_token_enc", ""):
@@ -1194,6 +1480,7 @@ async def _do_launch_openshell(
                     "JIRA_EMAIL": mcp.jira_email or "",
                 },
                 credentials={"JIRA_ACCESS_TOKEN": mcp.jira_access_token},
+                client=oc_client,
             )
             provider_names.append(pname)
             # URL and email are non-secret; pass them as plain env vars so the
@@ -1213,6 +1500,10 @@ async def _do_launch_openshell(
         except Exception:
             pass
 
+    # Slack Incoming Webhook: grant hooks.slack.com egress when the workspace
+    # has SLACK_WEBHOOK_URL configured (see docs/SLACK_NOTIFICATIONS.md).
+    _has_slack_webhook = slack_webhook_enabled(extra_env)
+
     policy = build_session_policy(
         session=session,
         repos=list(session.repos or []),
@@ -1222,6 +1513,7 @@ async def _do_launch_openshell(
         prompt_sources=list(prompt_sources or []),
         custom_policies=_custom_policies or None,
         has_google_cloud_provider=_has_google_cloud_provider,
+        has_slack_webhook=_has_slack_webhook,
     )
 
     # Capture serialisable data for the background task before committing.
@@ -1295,6 +1587,7 @@ async def _do_launch_openshell(
         _setup_openshell_sandbox(
             session_id=session.id,
             workspace_id=session.workspace_id,
+            client=oc_client,
             provider_names=provider_names,
             env_vars=env_vars,
             policy=policy,
@@ -1314,7 +1607,6 @@ async def _do_launch_openshell(
             mode=session.mode,
             main_cmd=main_cmd,
             resolved_prompt=resolved_prompt_safe,
-            ephemeral_disk=session.ephemeral_disk or DEFAULT_EPHEMERAL_DISK,
             iat_app_id=_iat_app_id,
             iat_installation_id=_iat_installation_id,
             iat_private_key=_iat_private_key,
@@ -1355,7 +1647,7 @@ async def _setup_openshell_sandbox(
     iat_provider_name: str = "",
     iat_repo_names: list[str] | None = None,
     pat_id: int | None = None,  # PAT DB ID for provider cleanup on completion
-    ephemeral_disk: str = DEFAULT_EPHEMERAL_DISK,
+    client=_CLIENT_UNSET,
 ) -> None:
     """Background task: create sandbox and run all setup steps, then launch agent."""
     from swarmer import openshell_client
@@ -1381,14 +1673,25 @@ async def _setup_openshell_sandbox(
             break
 
     try:
+        oc_client = client
+        if oc_client is _CLIENT_UNSET:
+            oc_client = await openshell_client.get_client_for_workspace(workspace_id)
         await _update_db(status_detail="Creating sandbox…")
-        ref = await openshell_client.create_sandbox(
-            image=image,
-            env_vars=env_vars,
-            policy=policy,
-            provider_names=provider_names,
-            ephemeral_storage=ephemeral_disk,
-        )
+        if oc_client is not None:
+            ref = await openshell_client.create_sandbox(
+                image=image,
+                env_vars=env_vars,
+                policy=policy,
+                provider_names=provider_names,
+                client=oc_client,
+            )
+        else:
+            ref = await openshell_client.create_sandbox(
+                image=image,
+                env_vars=env_vars,
+                policy=policy,
+                provider_names=provider_names,
+            )
         await _update_db(sandbox_name=ref.name, status_detail="Applying network policies…")
 
         # Check if the session was stopped while sandbox was being created (race condition).
@@ -1404,7 +1707,10 @@ async def _setup_openshell_sandbox(
             log.info("_setup_openshell_sandbox: session %d no longer pending (phase=%s), cleaning up sandbox %s",
                      session_id, current_phase, ref.name)
             try:
-                await openshell_client.delete_sandbox(ref.name)
+                if oc_client is not None:
+                    await openshell_client.delete_sandbox(ref.name, client=oc_client)
+                else:
+                    await openshell_client.delete_sandbox(ref.name)
             except Exception:
                 pass
             return
@@ -1428,11 +1734,19 @@ async def _setup_openshell_sandbox(
             model=config_model or model,
         )
         _config_json = _config_data.get(f"{tool_name}.json", "{}")
-        await openshell_client.write_agent_config(
-            sandbox_name=ref.name,
-            tool_name=tool_name,
-            config_json=_config_json,
-        )
+        if oc_client is not None:
+            await openshell_client.write_agent_config(
+                sandbox_name=ref.name,
+                tool_name=tool_name,
+                config_json=_config_json,
+                client=oc_client,
+            )
+        else:
+            await openshell_client.write_agent_config(
+                sandbox_name=ref.name,
+                tool_name=tool_name,
+                config_json=_config_json,
+            )
 
         # Share/state dir setup runs FIRST so the $HOME/.local/share/<tool> symlink
         # is in place before model_setup_cmd writes the model config through it.
@@ -1441,25 +1755,38 @@ async def _setup_openshell_sandbox(
         # environment automatically — no explicit injection needed.
         if share_cmd.strip():
             clean_share = share_cmd.rstrip().rstrip(";").rstrip()
-            await openshell_client.exec_command(
-                ref.name, ["sh", "-c", f"export HOME=/sandbox; {clean_share}"],
-                client=None,
-            )
+            if oc_client is not None:
+                await openshell_client.exec_command(
+                    ref.name, ["sh", "-c", f"export HOME=/sandbox; {clean_share}"],
+                    client=oc_client,
+                )
+            else:
+                await openshell_client.exec_command(
+                    ref.name, ["sh", "-c", f"export HOME=/sandbox; {clean_share}"],
+                )
 
         # Model selection config
         if model_setup_cmd.strip():
             clean_cmd = model_setup_cmd.rstrip().rstrip("&").rstrip()
-            await openshell_client.exec_command(
-                ref.name, ["sh", "-c", f"export HOME=/sandbox; {clean_cmd}"],
-                client=None,
-            )
+            if oc_client is not None:
+                await openshell_client.exec_command(
+                    ref.name, ["sh", "-c", f"export HOME=/sandbox; {clean_cmd}"],
+                    client=oc_client,
+                )
+            else:
+                await openshell_client.exec_command(
+                    ref.name, ["sh", "-c", f"export HOME=/sandbox; {clean_cmd}"],
+                )
 
         # Write AGENTS.md for all modes (prompt, tui, server).
         # TUI/server: the agent reads it automatically as system-level instructions.
         # Prompt mode: the agent command reads it via "$(</sandbox/AGENTS.md)" shell
         # expansion, giving the full context (prompt + repo layout) identically to TUI.
         if agents_md:
-            await openshell_client.write_agents_md(sandbox_name=ref.name, content=agents_md)
+            if oc_client is not None:
+                await openshell_client.write_agents_md(sandbox_name=ref.name, content=agents_md, client=oc_client)
+            else:
+                await openshell_client.write_agents_md(sandbox_name=ref.name, content=agents_md)
 
         await _update_db(status_detail="")
 
@@ -1468,11 +1795,17 @@ async def _setup_openshell_sandbox(
         # Must run before any git clone calls.  Guarded by has_git_token: sessions
         # without any git credential cannot have GitHub repos (enforced at launch time).
         if has_git_token:
-            await openshell_client.exec_command(
-                ref.name,
-                ["sh", "-c", "export HOME=/sandbox; gh auth setup-git"],
-                client=None,
-            )
+            if oc_client is not None:
+                await openshell_client.exec_command(
+                    ref.name,
+                    ["sh", "-c", "export HOME=/sandbox; gh auth setup-git"],
+                    client=oc_client,
+                )
+            else:
+                await openshell_client.exec_command(
+                    ref.name,
+                    ["sh", "-c", "export HOME=/sandbox; gh auth setup-git"],
+                )
 
         # Clone repos — network policies are pre-applied via SandboxSpec.policy so the
         # git binary has Landlock network access to github.com immediately at sandbox
@@ -1484,9 +1817,14 @@ async def _setup_openshell_sandbox(
                 # HOME=/sandbox must match the gh auth setup-git call above so git
                 # reads /sandbox/.gitconfig where the credential helper was registered.
                 clone_cmd = f"cd /sandbox && HOME=/sandbox git clone {shlex.quote(repo_url)} {shlex.quote(local_path)}"
-                result = await openshell_client.exec_command(
-                    ref.name, ["sh", "-c", clone_cmd], client=None
-                )
+                if oc_client is not None:
+                    result = await openshell_client.exec_command(
+                        ref.name, ["sh", "-c", clone_cmd], client=oc_client
+                    )
+                else:
+                    result = await openshell_client.exec_command(
+                        ref.name, ["sh", "-c", clone_cmd]
+                    )
                 if getattr(result, "exit_code", 0) != 0:
                     _stdout = getattr(result, "stdout", "") or ""
                     _stderr = getattr(result, "stderr", "") or ""
@@ -1496,9 +1834,14 @@ async def _setup_openshell_sandbox(
                         getattr(result, "exit_code", "?"),
                         (_stdout + _stderr).strip(),
                     )
-            await openshell_client.exec_command(
-                ref.name, ["sh", "-c", "git config --global --add safe.directory '*'"], client=None
-            )
+            if oc_client is not None:
+                await openshell_client.exec_command(
+                    ref.name, ["sh", "-c", "git config --global --add safe.directory '*'"], client=oc_client
+                )
+            else:
+                await openshell_client.exec_command(
+                    ref.name, ["sh", "-c", "git config --global --add safe.directory '*'"]
+                )
             # Checkout each repo's configured branch before creating the working
             # branch so the working branch is based on the correct upstream ref
             # (e.g. "develop") rather than always the repository default branch.
@@ -1509,9 +1852,14 @@ async def _setup_openshell_sandbox(
                         f"cd /sandbox/{shlex.quote(rd['local_path'])} && "
                         f"git checkout {shlex.quote(repo_branch)}"
                     )
-                    result = await openshell_client.exec_command(
-                        ref.name, ["sh", "-c", checkout_base_cmd], client=None
-                    )
+                    if oc_client is not None:
+                        result = await openshell_client.exec_command(
+                            ref.name, ["sh", "-c", checkout_base_cmd], client=oc_client
+                        )
+                    else:
+                        result = await openshell_client.exec_command(
+                            ref.name, ["sh", "-c", checkout_base_cmd]
+                        )
                     if getattr(result, "exit_code", 0) != 0:
                         _stdout = getattr(result, "stdout", "") or ""
                         _stderr = getattr(result, "stderr", "") or ""
@@ -1529,9 +1877,14 @@ async def _setup_openshell_sandbox(
                         f"git checkout -b {shlex.quote(working_branch)} 2>/dev/null "
                         f"|| git checkout {shlex.quote(working_branch)}"
                     )
-                    result = await openshell_client.exec_command(
-                        ref.name, ["sh", "-c", branch_cmd], client=None
-                    )
+                    if oc_client is not None:
+                        result = await openshell_client.exec_command(
+                            ref.name, ["sh", "-c", branch_cmd], client=oc_client
+                        )
+                    else:
+                        result = await openshell_client.exec_command(
+                            ref.name, ["sh", "-c", branch_cmd]
+                        )
                     if getattr(result, "exit_code", 0) != 0:
                         _stdout = getattr(result, "stdout", "") or ""
                         _stderr = getattr(result, "stderr", "") or ""
@@ -1544,20 +1897,32 @@ async def _setup_openshell_sandbox(
                         )
 
         # Build the agent command.
-        # Prompt mode: AGENTS.md was written above (prompt + repo context); read it at
-        # runtime via "$(</sandbox/AGENTS.md)" shell expansion — no newlines in args,
-        # full context identical to TUI mode.
+        # Prompt mode:
+        #   - AI-based tools (opencode): AGENTS.md was written above (prompt + repo
+        #     context); read it at runtime via "$(</sandbox/AGENTS.md)" shell expansion.
+        #   - Shell tool: instruction_prompt IS the command — run it directly, no AI hop.
         # TUI/server: main_cmd is "sleep infinity" / "opencode serve …"; agent is
         # started later by the WebSocket handler or start_agent().
         if mode == "prompt":
-            _tool_bin = {"opencode": "opencode run"}.get(tool_name, "opencode run")
-            if agents_md:
-                # Read the full AGENTS.md (prompt + repo context) as the CLI argument.
-                _model_arg = shlex.quote(model) if model else ""
-                agent_cmd = f"HOME=/sandbox {_tool_bin} --model {_model_arg} \"$(</sandbox/AGENTS.md)\""
+            if tool_name == "shell":
+                # Shell tool: run the raw command directly — no AI agent involved.
+                # main_cmd is already the verbatim instruction_prompt from build_main_cmd().
+                #
+                # Security note: instruction_prompt is injected into a compound sh -c
+                # string without sanitisation — shell metacharacters (;, &&, |, $(), etc.)
+                # are intentional: the whole point is to run arbitrary commands.  The
+                # sandbox container is the security boundary; only authenticated users
+                # (require_auth) with access to the workspace can set instruction_prompt.
+                agent_cmd = f"export HOME=/sandbox PATH=\"/sandbox/.local/bin:$PATH\" && cd /sandbox && {main_cmd}"
             else:
-                # No prompt configured — launch without a message argument.
-                agent_cmd = f"HOME=/sandbox {main_cmd}"
+                _tool_bin = {"opencode": "opencode run"}.get(tool_name, "opencode run")
+                if agents_md:
+                    # Read the full AGENTS.md (prompt + repo context) as the CLI argument.
+                    _model_arg = shlex.quote(model) if model else ""
+                    agent_cmd = f"HOME=/sandbox {_tool_bin} --model {_model_arg} \"$(</sandbox/AGENTS.md)\""
+                else:
+                    # No prompt configured — launch without a message argument.
+                    agent_cmd = f"HOME=/sandbox {main_cmd}"
         else:
             # Server and TUI modes: export HOME and PATH, cd into /sandbox/.
             # Mirrors tui_ws.py exactly: HOME=/sandbox, PATH includes /sandbox/.local/bin.
@@ -1574,6 +1939,7 @@ async def _setup_openshell_sandbox(
             _run_openshell_agent(
                 session_id=session_id,
                 workspace_id=workspace_id,
+                client=oc_client,
                 sandbox_name=ref.name,
                 cmd=["sh", "-c", agent_cmd],
                 mode=mode,
@@ -1597,6 +1963,7 @@ async def _setup_openshell_sandbox(
                 app_id = iat_app_id
                 installation_id = iat_installation_id
                 private_key = iat_private_key
+                workspace_id = workspace_id
 
             asyncio.create_task(
                 start_token_refresh_loop(
@@ -1604,6 +1971,9 @@ async def _setup_openshell_sandbox(
                     session_id=session_id,
                     provider_name=iat_provider_name,
                     repo_names=iat_repo_names or None,
+                    workspace_id=workspace_id,
+                    client=oc_client,
+                    resolve_workspace_client=False,
                 ),
                 name=f"iat-refresh-{session_id}",
             )
@@ -1612,7 +1982,11 @@ async def _setup_openshell_sandbox(
         raise
     except Exception:
         log.exception("_setup_openshell_sandbox failed for session %d", session_id)
-        await _update_db(phase="failed", run_completed_at=datetime.now(timezone.utc))
+        await _update_db(
+            phase="failed",
+            status_detail="OpenShell sandbox setup failed",
+            run_completed_at=datetime.now(timezone.utc),
+        )
 
 
 async def _run_openshell_agent(
@@ -1624,6 +1998,7 @@ async def _run_openshell_agent(
     agent_tool: str,
     env_vars: dict | None = None,
     pat_id: int | None = None,
+    client=_CLIENT_UNSET,
 ) -> None:
     """Background task: starts the agent in the sandbox and tracks completion."""
     from swarmer import openshell_client
@@ -1631,6 +2006,56 @@ async def _run_openshell_agent(
     from swarmer.models.session import Session as _Session
 
     _TERMINAL_PHASES = frozenset(("succeeded", "failed", "stopped"))
+
+    # Collect non-empty injected credential values so bare secret strings in shell output are redacted
+    injected_secrets: set[str] = set()
+    if env_vars:
+        for _v in env_vars.values():
+            if _v and isinstance(_v, str) and _v.strip():
+                injected_secrets.add(_v)
+
+    try:
+        async for _db in _get_db():
+            from sqlalchemy import select as sa_select
+            from swarmer.models.github_pat import GitHubPAT
+            from swarmer.models.mcp_server import McpServer
+            from swarmer.models.opencode_secret import OpencodeSecret
+            from swarmer.models.sandbox_env_var import SandboxEnvVar
+
+            if pat_id:
+                _pat_obj = await _db.get(GitHubPAT, pat_id)
+                if _pat_obj and _pat_obj.pat and _pat_obj.pat.strip():
+                    injected_secrets.add(_pat_obj.pat)
+
+            _s = await _db.get(_Session, session_id)
+            if _s and _s.github_pat and _s.github_pat.pat and _s.github_pat.pat.strip():
+                injected_secrets.add(_s.github_pat.pat)
+
+            _ev_res = await _db.execute(
+                sa_select(SandboxEnvVar).where(SandboxEnvVar.workspace_id == workspace_id)
+            )
+            for row in _ev_res.scalars().all():
+                if row.value and isinstance(row.value, str) and row.value.strip():
+                    injected_secrets.add(row.value)
+
+            _sec_res = await _db.execute(
+                sa_select(OpencodeSecret).where(OpencodeSecret.workspace_id == workspace_id)
+            )
+            for row in _sec_res.scalars().all():
+                if row.google_api_key and isinstance(row.google_api_key, str) and row.google_api_key.strip():
+                    injected_secrets.add(row.google_api_key)
+
+            _mcp_res = await _db.execute(
+                sa_select(McpServer).where(McpServer.workspace_id == workspace_id)
+            )
+            for row in _mcp_res.scalars().all():
+                if hasattr(row, "jira_access_token") and row.jira_access_token and isinstance(row.jira_access_token, str) and row.jira_access_token.strip():
+                    injected_secrets.add(row.jira_access_token)
+                if hasattr(row, "access_token") and row.access_token and isinstance(row.access_token, str) and row.access_token.strip():
+                    injected_secrets.add(row.access_token)
+            break
+    except Exception:
+        log.warning("_run_openshell_agent: failed to load secret values for redaction", exc_info=True)
 
     async def _update_db(**fields) -> None:
         from swarmer.session_runs import record_session_run as _record_run
@@ -1665,6 +2090,9 @@ async def _run_openshell_agent(
             break
 
     try:
+        oc_client = client
+        if oc_client is _CLIENT_UNSET:
+            oc_client = await openshell_client.get_client_for_workspace(workspace_id)
         if mode != "server":
             # Server mode stays "pending" until expose_service succeeds and the
             # service_url is stored — the Chat tab only becomes accessible then.
@@ -1680,36 +2108,65 @@ async def _run_openshell_agent(
 
             async def _on_output(text: str) -> None:
                 _streamed[:] = [text]
-                await _update_db(last_output=text, raw_output=text)
+                # Redact secrets before persisting streamed output for all tools.
+                # OpenCode may still surface env assignments (e.g. printenv),
+                # including gateway-injected keys not present in injected_secrets.
+                _safe = _redact_secrets(text, secret_values=injected_secrets)
+                await _update_db(last_output=_safe, raw_output=_safe)
 
-            result = await openshell_client.exec_command_streaming(
-                sandbox_name, cmd,
-                on_output=_on_output,
-                poll_interval=5.0,
-                env=env_vars or {},
-            )
+            if oc_client is not None:
+                result = await openshell_client.exec_command_streaming(
+                    sandbox_name, cmd,
+                    on_output=_on_output,
+                    poll_interval=5.0,
+                    env=env_vars or {},
+                    client=oc_client,
+                )
+            else:
+                result = await openshell_client.exec_command_streaming(
+                    sandbox_name, cmd,
+                    on_output=_on_output,
+                    poll_interval=5.0,
+                    env=env_vars or {},
+                )
             exit_code = getattr(result, "exit_code", None)
             stderr = getattr(result, "stderr", "") or ""
             phase = "succeeded" if exit_code == 0 else "failed"
 
-            # OpenCode stores the response in its SQLite DB, not stdout.
+            # OpenCode stores the response in its SQLite DB, not stdout, so we
+            # do a final read_opencode_response call after the exec completes.
             # On success: prefer the SQLite response (full conversation).
             # On failure: SQLite may be empty; prefer the accumulated streaming
             # output over the sparse ExecResult.stdout (which is the same
             # incremental stdout that on_output already captured, but only the
             # last chunk — the accumulated buffer has everything).
+            # Shell tool runs a raw command directly — there is no OpenCode
+            # SQLite DB to read, so skip that call entirely and use the
+            # streamed stdout/stderr as the result.
             _streamed_text = _streamed[0] if _streamed else ""
-            output = (
-                await openshell_client.read_opencode_response(sandbox_name)
-                or _streamed_text
-                or stderr
-            )
+            if agent_tool == "shell":
+                # Use streamed stdout; fall back to stderr on failure.
+                _raw_output = _streamed_text or stderr
+            else:
+                if oc_client is not None:
+                    res_opencode = await openshell_client.read_opencode_response(sandbox_name, client=oc_client)
+                else:
+                    res_opencode = await openshell_client.read_opencode_response(sandbox_name)
+                _raw_output = (
+                    res_opencode
+                    or _streamed_text
+                    or stderr
+                )
+            output = _redact_secrets(_raw_output, secret_values=injected_secrets)
 
             # Snapshot draft policy chunks before any sandbox deletion so the
             # Policy tab can show what was denied/proposed during this run.
             chunks_json = ""
             try:
-                chunks = await openshell_client.get_draft_chunks(sandbox_name)
+                if oc_client is not None:
+                    chunks = await openshell_client.get_draft_chunks(sandbox_name, client=oc_client)
+                else:
+                    chunks = await openshell_client.get_draft_chunks(sandbox_name)
                 if chunks:
                     import json as _json_chunks
                     chunks_json = _json_chunks.dumps(chunks)
@@ -1719,27 +2176,39 @@ async def _run_openshell_agent(
             new_sandbox_name: str | None = sandbox_name
             if phase == "succeeded":
                 try:
-                    await openshell_client.delete_sandbox(sandbox_name)
+                    if oc_client is not None:
+                        await openshell_client.delete_sandbox(sandbox_name, client=oc_client)
+                    else:
+                        await openshell_client.delete_sandbox(sandbox_name)
                     new_sandbox_name = None
                 except Exception:
                     log.warning("Auto-cleanup of sandbox %s failed", sandbox_name, exc_info=True)
                 # Providers can only be deleted after sandbox is gone (Gateway rejects
                 # DeleteProvider with FAILED_PRECONDITION while sandbox is still attached).
-                await _delete_github_app_provider(workspace_id, session_id)
-                await _delete_pat_provider(workspace_id, pat_id, session_id)
+                await _delete_github_app_provider(workspace_id, session_id, client=oc_client)
+                await _delete_pat_provider(workspace_id, pat_id, session_id, client=oc_client)
             else:
-                # failed/stopped — sandbox left running for debugging; providers stay
-                # attached and will be cleaned up when the session is stopped/deleted.
+                # failed/stopped — sandbox intentionally left running so the user
+                # can inspect stdout/stderr and re-run.  Providers (GitHub PAT,
+                # Jira token) stay attached to the sandbox; they are cleaned up
+                # when the session is explicitly stopped or deleted.
+                #
+                # Security note: leaving providers attached means the sandbox
+                # retains network credentials until explicit cleanup.  The risk
+                # is bounded by the sandbox's network policy (egress is still
+                # restricted to approved hosts/ports) and the requirement that
+                # only authenticated workspace members can interact with it.
                 log.info(
                     "_run_openshell_agent: skipping provider cleanup for phase=%s session=%d "
                     "(sandbox still attached — cleanup on explicit stop/delete)",
                     phase, session_id,
                 )
 
+            _final_raw = _redact_secrets(_streamed_text, secret_values=injected_secrets)
             await _update_db(
                 phase=phase,
                 last_output=output,
-                raw_output=_streamed_text,  # preserve raw console log regardless of agent tool
+                raw_output=_final_raw,  # preserve raw console log regardless of agent tool
                 status_detail="",  # clear any stale status from previous runs
                 policy_chunks=chunks_json,
                 run_completed_at=datetime.now(timezone.utc),
@@ -1752,7 +2221,10 @@ async def _run_openshell_agent(
                 # immediately; the sandbox stays alive serving HTTP.
                 # Provider env vars (GOOGLE_API_KEY etc.) are inherited from the
                 # sandbox environment automatically — no explicit injection needed.
-                await openshell_client.start_agent(sandbox_name, cmd, env=env_vars or {})
+                if oc_client is not None:
+                    await openshell_client.start_agent(sandbox_name, cmd, env=env_vars or {}, client=oc_client)
+                else:
+                    await openshell_client.start_agent(sandbox_name, cmd, env=env_vars or {})
 
             # TUI mode: the sandbox is ready; the TUI WebSocket handler starts the
             # agent interactively via exec_interactive when the user connects.
@@ -1765,9 +2237,14 @@ async def _run_openshell_agent(
                 try:
                     await _update_db(status_detail="Waiting for server to start…")
                     await asyncio.sleep(8)  # let the server process start listening
-                    service_url = await openshell_client.expose_service(
-                        sandbox_name, "agent", port
-                    )
+                    if oc_client is not None:
+                        service_url = await openshell_client.expose_service(
+                            sandbox_name, "agent", port, client=oc_client
+                        )
+                    else:
+                        service_url = await openshell_client.expose_service(
+                            sandbox_name, "agent", port
+                        )
                     # Transition to running and store the URL atomically so the
                     # Chat tab is only accessible once it's reachable.
                     await _update_db(phase="running", service_url=service_url, status_detail="")
@@ -1823,6 +2300,16 @@ async def session_launch(
 
     if session.is_active:
         return RedirectResponse(url=f"/workspaces/{ws_id}/sessions/{sid}", status_code=302)
+
+    # This is a manual UI-triggered launch, never a cron/event dispatch (those
+    # go through scheduler.py / pr_watcher.py which set their own context) —
+    # clear any stale event_context left over from a prior event-triggered run
+    # on this session so Run History doesn't mislabel this run as event-driven
+    # (ACM-42674 follow-up; mirrors the REST API launch_session behavior).
+    # Committed immediately rather than left pending on `session` so the
+    # clear is durable even if _do_launch fails before its own next commit.
+    session.event_context = ""
+    await db.commit()
 
     if save_config:
         if name.strip():
@@ -1912,12 +2399,18 @@ async def session_stop(
             _t.cancel()
             log.info("session_stop: cancelled background task %s", _t.get_name())
 
+    provider_client = _CLIENT_UNSET
     if session.sandbox_name:
         from swarmer import openshell_client
+        client = await openshell_client.get_client_for_workspace(ws_id, db)
+        provider_client = client
         # Snapshot draft policy chunks before deleting the sandbox so the
         # Policy tab remains useful after the session is stopped.
         try:
-            chunks = await openshell_client.get_draft_chunks(session.sandbox_name)
+            if client is not None:
+                chunks = await openshell_client.get_draft_chunks(session.sandbox_name, client=client)
+            else:
+                chunks = await openshell_client.get_draft_chunks(session.sandbox_name)
             if chunks:
                 import json as _json_stop
                 session.policy_chunks = _json_stop.dumps(chunks)
@@ -1925,11 +2418,17 @@ async def session_stop(
             log.warning("Failed to snapshot policy chunks on stop for session %d", sid, exc_info=True)
         if session.service_url:
             try:
-                await openshell_client.delete_service(session.sandbox_name, "agent")
+                if client is not None:
+                    await openshell_client.delete_service(session.sandbox_name, "agent", client=client)
+                else:
+                    await openshell_client.delete_service(session.sandbox_name, "agent")
             except Exception as exc:
                 log.warning("DeleteService failed for session %d: %s", sid, exc)
         try:
-            await openshell_client.delete_sandbox(session.sandbox_name)
+            if client is not None:
+                await openshell_client.delete_sandbox(session.sandbox_name, client=client)
+            else:
+                await openshell_client.delete_sandbox(session.sandbox_name)
         except Exception as exc:
             flash(request, f"Sandbox deletion failed: {exc}", "warning")
         session.sandbox_name = None
@@ -1937,8 +2436,8 @@ async def session_stop(
 
     # Clean up GitHub credentials providers AFTER sandbox deletion — the Gateway
     # rejects DeleteProvider with FAILED_PRECONDITION if the sandbox is still attached.
-    await _delete_github_app_provider(ws_id, sid)
-    await _delete_pat_provider(ws_id, session.github_pat_id, sid)
+    await _delete_github_app_provider(ws_id, sid, client=provider_client)
+    await _delete_pat_provider(ws_id, session.github_pat_id, sid, client=provider_client)
 
     from swarmer.session_runs import STOPPED_BY_USER_DETAIL, record_session_run
 
@@ -2052,7 +2551,11 @@ async def session_unschedule(
 
 async def _get_schedule_items_context(ws_id: int, sid: int, db: AsyncSession) -> dict:
     """Return context dict for the _schedule_items.html partial."""
-    from swarmer.models.session_schedule import SessionSchedule
+    from swarmer.models.session_schedule import (
+        AUTHOR_SCOPES,
+        EVENT_CONDITIONS,
+        SessionSchedule,
+    )
     result = await db.execute(
         select(SessionSchedule)
         .where(SessionSchedule.session_id == sid)
@@ -2064,6 +2567,8 @@ async def _get_schedule_items_context(ws_id: int, sid: int, db: AsyncSession) ->
         "schedules": schedules,
         "prompt_sources": prompt_sources,
         "cron_presets": CRON_PRESETS,
+        "event_conditions": EVENT_CONDITIONS,
+        "author_scopes": AUTHOR_SCOPES,
     }
 
 
@@ -2098,10 +2603,16 @@ async def schedule_create(
     ws_id: int,
     sid: int,
     request: Request,
+    trigger_type: str = Form("cron"),
+    event_condition: str = Form(""),
+    author_scope: str = Form("all"),
+    fix_authors: str = Form(""),
     cron_expr: str = Form(""),
     label: str = Form(""),
     prompt_id: str = Form(""),
+    provider: str = Form(""),
     instruction_prompt: str = Form(""),
+    include_event_context: bool = Form(False),
     enabled: str = Form("on"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2113,18 +2624,42 @@ async def schedule_create(
     if ws is None or session is None or session.workspace_id != ws_id:
         return HTMLResponse("", status_code=404)
 
-    cron_expr = cron_expr.strip()
-    if not cron_expr or not _croniter.is_valid(cron_expr):
-        return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
+    trigger_type = trigger_type.strip().lower()
+    if trigger_type not in ("cron", "event"):
+        trigger_type = "cron"
+
+    cron_schedule = ""
+    cron_next_run = None
+    if trigger_type == "cron":
+        cron_expr = cron_expr.strip()
+        if not cron_expr or not _croniter.is_valid(cron_expr):
+            return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
+        cron_schedule = cron_expr
+        cron_next_run = _croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
 
     pid = int(prompt_id) if prompt_id.strip().isdigit() else None
+    if pid is None:
+        return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
+    prompt_result = await db.execute(
+        select(WorkspacePrompt)
+        .join(WorkspacePromptSource, WorkspacePrompt.source_id == WorkspacePromptSource.id)
+        .where(WorkspacePrompt.id == pid, WorkspacePromptSource.workspace_id == ws_id)
+    )
+    if prompt_result.scalar_one_or_none() is None:
+        return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
     sched = SessionSchedule(
         session_id=sid,
-        cron_schedule=cron_expr,
-        cron_next_run=_croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime),
+        trigger_type=trigger_type,
+        event_condition=event_condition.strip() if trigger_type == "event" else "",
+        author_scope=author_scope.strip() if trigger_type == "event" else "all",
+        fix_authors=fix_authors.strip() if trigger_type == "event" else "",
+        cron_schedule=cron_schedule,
+        cron_next_run=cron_next_run,
         label=label.strip(),
         prompt_id=pid,
+        provider=provider.strip() if provider.strip() in ("", "claude", "gemini", "openai") else "",
         instruction_prompt=instruction_prompt,
+        include_event_context=include_event_context,
         enabled=(enabled == "on"),
     )
     db.add(sched)
@@ -2141,11 +2676,16 @@ async def schedule_edit(
     sid: int,
     sched_id: int,
     request: Request,
+    trigger_type: str = Form("cron"),
+    event_condition: str = Form(""),
+    author_scope: str = Form("all"),
+    fix_authors: str = Form(""),
     cron_expr: str = Form(""),
     label: str = Form(""),
     prompt_id: str = Form(""),
+    provider: str = Form(""),
     instruction_prompt: str = Form(""),
-    enabled: str = Form(""),
+    include_event_context: bool = Form(False),
     db: AsyncSession = Depends(get_db),
 ):
     from croniter import croniter as _croniter
@@ -2157,16 +2697,48 @@ async def schedule_edit(
     if ws is None or session is None or session.workspace_id != ws_id or sched is None or sched.session_id != sid:
         return HTMLResponse("", status_code=404)
 
-    cron_expr = cron_expr.strip()
-    if not cron_expr or not _croniter.is_valid(cron_expr):
+    pid = int(prompt_id) if prompt_id.strip().isdigit() else None
+    if pid is None:
+        return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
+    prompt_result = await db.execute(
+        select(WorkspacePrompt)
+        .join(WorkspacePromptSource, WorkspacePrompt.source_id == WorkspacePromptSource.id)
+        .where(WorkspacePrompt.id == pid, WorkspacePromptSource.workspace_id == ws_id)
+    )
+    if prompt_result.scalar_one_or_none() is None:
         return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
 
-    sched.cron_schedule = cron_expr
-    sched.cron_next_run = _croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
+    trigger_type = trigger_type.strip().lower()
+    if trigger_type not in ("cron", "event"):
+        trigger_type = "cron"
+
+    sched.trigger_type = trigger_type
+    if trigger_type == "event":
+        sched.event_condition = event_condition.strip()
+        sched.author_scope = author_scope.strip() or "all"
+        sched.fix_authors = fix_authors.strip()
+        sched.cron_schedule = ""
+        sched.cron_next_run = None
+    else:
+        cron_expr = cron_expr.strip()
+        if not cron_expr or not _croniter.is_valid(cron_expr):
+            return HTMLResponse("", status_code=422, headers={"HX-Trigger": "scheduleFormError"})
+        sched.cron_schedule = cron_expr
+        sched.cron_next_run = _croniter(cron_expr, datetime.now(timezone.utc)).get_next(datetime)
+        sched.event_condition = ""
+        sched.author_scope = "all"
+        sched.fix_authors = ""
+
     sched.label = label.strip()
-    sched.prompt_id = int(prompt_id) if prompt_id.strip().isdigit() else None
+    sched.prompt_id = pid
+    sched.provider = provider.strip() if provider.strip() in ("", "claude", "gemini", "openai") else ""
     sched.instruction_prompt = instruction_prompt
-    sched.enabled = (enabled == "on")
+    if trigger_type == "event":
+        sched.include_event_context = include_event_context
+    # Enabled/disabled state is managed exclusively by the schedule_toggle
+    # endpoint. The inline edit form has no `enabled` field, so this handler
+    # must never touch sched.enabled — doing so previously forced every edit
+    # to silently disable the schedule (ACM-39209).
     await db.commit()
     return HTMLResponse("", headers={"HX-Trigger": "scheduleListChanged"})
 
@@ -2312,7 +2884,8 @@ async def session_policy_chunks(
         # Live fetch from gateway while sandbox is running
         from swarmer import openshell_client
         try:
-            chunks = await openshell_client.get_draft_chunks(session.sandbox_name)
+            client = await openshell_client.get_client_for_workspace(ws_id, db)
+            chunks = await openshell_client.get_draft_chunks(session.sandbox_name, client=client)
         except Exception:
             pass  # get_draft_chunks logs internally; [] is the safe fallback
     elif session.policy_chunks:
@@ -2491,7 +3064,8 @@ async def session_policy_rules_add(
             ]
             if chunk_ids:
                 try:
-                    n = await _oc.approve_chunks_by_id(session.sandbox_name, chunk_ids)
+                    oc_client = await _oc.get_client_for_workspace(ws_id, db)
+                    n = await _oc.approve_chunks_by_id(session.sandbox_name, chunk_ids, client=oc_client)
                     live_applied = n > 0
                 except Exception as exc:
                     log.warning(
@@ -2555,10 +3129,12 @@ async def session_policy_rules_delete(
         stored_chunk_id = deleted_rule.get("chunk_id", "")
         chunk_ids = [stored_chunk_id] if stored_chunk_id else []
         try:
+            oc_client = await _oc.get_client_for_workspace(ws_id, db)
             n = await _oc.undo_chunks_by_rule_name(
                 session.sandbox_name,
                 rule_names=[rule_name],
                 chunk_ids=chunk_ids or None,
+                client=oc_client,
             )
             live_revoked = n > 0
         except Exception as exc:
@@ -2624,22 +3200,31 @@ async def session_delete(
         flash(request, "Stop the session before deleting it.", "danger")
         return RedirectResponse(url=f"/workspaces/{ws_id}/sessions/{sid}", status_code=302)
 
+    provider_client = _CLIENT_UNSET
     if session.sandbox_name:
         # OpenShell session — delete sandbox
         from swarmer import openshell_client
+        client = await openshell_client.get_client_for_workspace(ws_id, db)
+        provider_client = client
         if session.service_url:
             try:
-                await openshell_client.delete_service(session.sandbox_name, "agent")
+                if client is not None:
+                    await openshell_client.delete_service(session.sandbox_name, "agent", client=client)
+                else:
+                    await openshell_client.delete_service(session.sandbox_name, "agent")
             except Exception as exc:
                 log.warning("DeleteService failed for session %d: %s", sid, exc)
         try:
-            await openshell_client.delete_sandbox(session.sandbox_name)
+            if client is not None:
+                await openshell_client.delete_sandbox(session.sandbox_name, client=client)
+            else:
+                await openshell_client.delete_sandbox(session.sandbox_name)
         except Exception as exc:
             flash(request, f"Sandbox deletion failed: {exc}", "warning")
 
     # Clean up GitHub credentials providers (App IAT and PAT).
-    await _delete_github_app_provider(ws_id, sid)
-    await _delete_pat_provider(ws_id, session.github_pat_id, sid)
+    await _delete_github_app_provider(ws_id, sid, client=provider_client)
+    await _delete_pat_provider(ws_id, session.github_pat_id, sid, client=provider_client)
 
     await db.delete(session)
     await db.commit()
@@ -2841,7 +3426,18 @@ def _prefix_diff_paths(diff: str, prefix: str) -> str:
 
 
 async def _build_commit_msg(patch: str, workspace_id: int, db: AsyncSession) -> str:
-    """Use an LLM to generate a commit message from the diff."""
+    """Use an LLM to generate a commit message from the diff.
+
+    Gemini-based generation calls the Google API directly from the Swarmer
+    process, which requires a plaintext key in-process. Since ACM-37263 the
+    Gemini key is pushed to the OpenShell gateway at save time and the gateway
+    never returns credentials in plaintext (REDACTED), so this path only works
+    for workspaces with a legacy key still present in ``google_api_key_enc``
+    from before the migration. New/rotated keys are gateway-only and fall
+    through to the file-list summary below — there is no in-process
+    replacement for this feature short of running generation inside the
+    sandbox (out of scope here).
+    """
     truncated = patch[:8000] if len(patch) > 8000 else patch
 
     oc_result = await db.execute(

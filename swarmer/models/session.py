@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -16,7 +17,7 @@ from swarmer.database import Base
 # Valid phase values
 PHASES = ("idle", "queued", "pending", "running", "succeeded", "failed", "stopped")
 
-AGENT_TOOLS = ("opencode",)
+AGENT_TOOLS = ("opencode", "shell")
 
 CRON_PRESETS: dict[str, str] = {
     "*/30 * * * *": "Every 30 min",
@@ -33,12 +34,7 @@ CRON_PRESETS: dict[str, str] = {
 #   prompt — sandbox runs, exits on completion; sandbox deleted on success
 MODES = ("tui", "server", "prompt")
 
-# Valid ephemeral_disk values (Kubernetes quantity strings) — sets the sandbox pod's
-# ephemeral-storage compute resource requests/limits (container writable layer /
-# unsized emptyDirs). Configurable per-session since one size doesn't fit both quick
-# sessions and large-repo CVE scans (ACM-38172, ACM-38184).
-EPHEMERAL_DISK_OPTIONS = ("2Gi", "5Gi", "10Gi")
-DEFAULT_EPHEMERAL_DISK = "2Gi"
+
 
 
 class Session(Base):
@@ -59,7 +55,7 @@ class Session(Base):
     mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="prompt", server_default="prompt"
     )
-    # Stores the selected AI provider ("claude"/"gemini" family preset — the
+    # Stores the selected AI provider ("claude"/"gemini"/"openai" family preset — the
     # only UX since ACM-37232 removed individual model selection). Named
     # "provider" (not "model") because it identifies which backing AI
     # provider/credential (Vertex AI vs. Google AI Studio) the session uses,
@@ -78,11 +74,15 @@ class Session(Base):
     # Which SessionSchedule triggered the current run; cleared on stop/completion.
     active_schedule_id: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     mcp_server_ids: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
-    # Ephemeral disk size for the sandbox pod's ephemeral-storage compute resource
-    # (Kubernetes quantity string — one of EPHEMERAL_DISK_OPTIONS). Per-session
-    # replacement for the old global SANDBOX_EPHEMERAL_STORAGE env var (ACM-38184).
+    # Vestigial (ACM-39804): was a per-session UI control for the sandbox pod's
+    # ephemeral-storage compute resource (ACM-38184), but that resource only bounds
+    # the container writable layer / unsized emptyDirs — not the `/sandbox` working
+    # directory, which is a gateway-wide PVC (`workspaceDefaultStorageSize`). The
+    # dropdown was removed as misleading; ephemeral-storage is now hardcoded to 10Gi
+    # in openshell_client.create_sandbox(). Column/migration kept to avoid a
+    # destructive schema change; no longer read anywhere.
     ephemeral_disk: Mapped[str] = mapped_column(
-        String(32), nullable=False, default=DEFAULT_EPHEMERAL_DISK, server_default=DEFAULT_EPHEMERAL_DISK
+        String(32), nullable=False, default="2Gi", server_default="2Gi"
     )
     # Runtime state — managed by dashboard
     sandbox_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -90,6 +90,7 @@ class Session(Base):
     last_output: Mapped[str] = mapped_column(Text, nullable=False, default="")
     raw_output: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     status_detail: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    event_context: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     # OpenShell draft policy chunks — JSON snapshot from last run (cleared on next launch)
     policy_chunks: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     # Session-level custom network rules approved from chunks — JSON array, cumulative
@@ -178,6 +179,69 @@ class Session(Base):
         if not enabled:
             return None
         return min(s.cron_next_run for s in enabled)
+
+    @property
+    def active_schedule(self) -> "SessionSchedule | None":  # noqa: F821
+        """The SessionSchedule currently driving this run, if any.
+
+        `active_schedule_id` is set by the scheduler at launch time and
+        cleared on completion/stop. `schedules` is eager-loaded
+        (lazy="selectin"), so this never triggers a lazy DB call.
+        """
+        if not self.active_schedule_id:
+            return None
+        for sched in self.schedules or []:
+            if sched.id == self.active_schedule_id:
+                return sched
+        return None
+
+    @property
+    def has_pending_chunks(self) -> bool:
+        """True if session.policy_chunks has at least one draft chunk not
+        yet promoted into custom_policies (i.e. needs review on the Net
+        Rules tab).
+
+        Mirrors the "is_pending" matching logic in
+        sessions/_policy_chunks.html / session_policy_chunks(): a chunk is
+        pending unless its rule_name exists in custom_policies AND every
+        one of its binary paths is already covered by that rule.
+        """
+        if not self.policy_chunks:
+            return False
+        try:
+            chunks = json.loads(self.policy_chunks)
+        except (ValueError, TypeError):
+            return False
+        if not chunks:
+            return False
+
+        promoted_binaries: dict[str, set[str]] = {}
+        if self.custom_policies:
+            try:
+                for rule in json.loads(self.custom_policies):
+                    if not isinstance(rule, dict):
+                        continue
+                    name = rule.get("name")
+                    if name:
+                        promoted_binaries[name] = {
+                            b.get("path", "") for b in (rule.get("binaries") or []) if isinstance(b, dict)
+                        }
+            except (ValueError, TypeError):
+                pass
+
+        try:
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("status") != "pending":
+                    continue
+                chunk_bins = {b.get("path", "") for b in (chunk.get("binaries") or []) if isinstance(b, dict)}
+                rule_bins = promoted_binaries.get(chunk.get("rule_name"))
+                if rule_bins is None or not chunk_bins.issubset(rule_bins):
+                    return True
+            return False
+        except (ValueError, TypeError, AttributeError):
+            return False
 
     @property
     def phase_badge_class(self) -> str:

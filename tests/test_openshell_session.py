@@ -113,16 +113,7 @@ async def _setup_db(monkeypatch):
     settings.k8s_namespace = ""  # must be empty to allow workspace creation
     settings.max_concurrent_agents = 0  # unlimited by default for these tests
 
-    async def _all_accessible(token, namespaces, api_url, in_cluster):
-        return list(namespaces)
-
-    async def _can_create_namespaces(token, api_url, in_cluster):
-        return True
-
-    monkeypatch.setattr("swarmer.api.deps.get_accessible_namespaces", _all_accessible)
-    monkeypatch.setattr("swarmer.api.v1.workspaces.can_create_namespaces", _can_create_namespaces)
     monkeypatch.setattr("swarmer.k8s.ensure_namespace", lambda namespace: None)
-    monkeypatch.setattr("swarmer.k8s.grant_swarmer_user_access", lambda namespace, username: None)
     monkeypatch.setattr("swarmer.k8s.delete_namespace", lambda namespace: None)
 
     import swarmer.models  # noqa: F401
@@ -176,11 +167,8 @@ async def _create_session(
     name: str = "s1",
     mode: str = "prompt",
     agent_tool: str = "opencode",
-    ephemeral_disk: str | None = None,
 ) -> dict:
     body = {"name": name, "mode": mode, "agent_tool": agent_tool}
-    if ephemeral_disk is not None:
-        body["ephemeral_disk"] = ephemeral_disk
     resp = await client.post(
         f"/api/v1/workspaces/{ws_id}/sessions",
         json=body,
@@ -337,12 +325,12 @@ class TestDoLaunchOpenshell:
                 "swarmer.routers.sessions._wait_vertex_provider_ready",
                 new=AsyncMock(),
             ),
-            # provider_exists is called in _do_launch_openshell to check for the
-            # google-cloud (Vertex ADC) provider. Without this patch it tries to
-            # use the real gRPC client (not available in CI) and raises AttributeError.
+            # provider_exists is called in _do_launch_openshell to check gateway
+            # providers. Model the normal case as configured; individual tests
+            # override this for provider-absent scenarios.
             "provider_exists": patch(
                 "swarmer.openshell_client.provider_exists",
-                new=AsyncMock(return_value=False),
+                new=AsyncMock(return_value=True),
             ),
             # get_image() raises ValueError when AGENT_IMAGE_OPENCODE is unset (CI).
             # Patch at the agent-tool level so all launch paths get a valid image.
@@ -396,111 +384,6 @@ class TestDoLaunchOpenshell:
         mock_setup.assert_called_once()
         call_kwargs = mock_setup.call_args[1] if mock_setup.call_args else {}
         assert "image" in call_kwargs
-
-    @pytest.mark.asyncio
-    async def test_ephemeral_disk_default_passed_to_setup_sandbox(self, client):
-        """A session created without specifying ephemeral_disk defaults to 2Gi
-        and that value is threaded into _setup_openshell_sandbox (ACM-38184)."""
-        ws = await _create_workspace(client)
-        s = await _create_session(client, ws["id"])
-        assert s["ephemeral_disk"] == "2Gi"
-
-        patches = self._patch_openshell()
-        with patches["create_provider"], patches["ensure_provider"], \
-             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
-             patches["create_sandbox"], \
-             patches["write_agent_config"], \
-             patches["write_agents_md"], patches["exec_command"], \
-             patches["start_agent"], patches["delete_sandbox"], \
-             patches["build_policy"], patches["run_agent"], \
-             patches["setup_sandbox"] as mock_setup, \
-             patches["provider_exists"], patches["get_image"]:
-            resp = await client.post(
-                f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch"
-            )
-            await asyncio.sleep(0)
-
-        assert resp.status_code == 200
-        mock_setup.assert_called_once()
-        call_kwargs = mock_setup.call_args[1] if mock_setup.call_args else {}
-        assert call_kwargs.get("ephemeral_disk") == "2Gi"
-
-    @pytest.mark.asyncio
-    async def test_ephemeral_disk_custom_value_passed_to_setup_sandbox(self, client):
-        """A session created with ephemeral_disk='10Gi' threads that value through
-        to _setup_openshell_sandbox instead of the removed global setting (ACM-38184)."""
-        ws = await _create_workspace(client)
-        s = await _create_session(client, ws["id"], ephemeral_disk="10Gi")
-        assert s["ephemeral_disk"] == "10Gi"
-
-        patches = self._patch_openshell()
-        with patches["create_provider"], patches["ensure_provider"], \
-             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
-             patches["create_sandbox"], \
-             patches["write_agent_config"], \
-             patches["write_agents_md"], patches["exec_command"], \
-             patches["start_agent"], patches["delete_sandbox"], \
-             patches["build_policy"], patches["run_agent"], \
-             patches["setup_sandbox"] as mock_setup, \
-             patches["provider_exists"], patches["get_image"]:
-            resp = await client.post(
-                f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch"
-            )
-            await asyncio.sleep(0)
-
-        assert resp.status_code == 200
-        mock_setup.assert_called_once()
-        call_kwargs = mock_setup.call_args[1] if mock_setup.call_args else {}
-        assert call_kwargs.get("ephemeral_disk") == "10Gi"
-
-    @pytest.mark.asyncio
-    async def test_setup_sandbox_passes_ephemeral_disk_to_create_sandbox(self, client):
-        """_setup_openshell_sandbox forwards ephemeral_disk to
-        openshell_client.create_sandbox(ephemeral_storage=...) (ACM-38184)."""
-        from swarmer.routers.sessions import _setup_openshell_sandbox
-
-        ws = await _create_workspace(client)
-        s = await _create_session(client, ws["id"], ephemeral_disk="5Gi")
-
-        async with _TestSession() as db:
-            await db.execute(
-                text("UPDATE sessions SET phase='pending' WHERE id=:id"), {"id": s["id"]}
-            )
-            await db.commit()
-
-        ref = _fake_sandbox_ref("sandbox-ephemeral-disk-test")
-        with patch("swarmer.database.get_db", new=_make_test_db_provider()), \
-             patch("swarmer.openshell_client.create_sandbox", new=AsyncMock(return_value=ref)) as mock_create, \
-             patch("swarmer.openshell_client.write_agent_config", new=AsyncMock()), \
-             patch("swarmer.openshell_client.write_agents_md", new=AsyncMock()), \
-             patch("swarmer.openshell_client.approve_draft_policy_chunks", new=AsyncMock(return_value=[])), \
-             patch("swarmer.routers.sessions._run_openshell_agent", new=AsyncMock()), \
-             patch("swarmer.openshell_client.exec_command", new=AsyncMock()):
-            await _setup_openshell_sandbox(
-                session_id=s["id"],
-                workspace_id=ws["id"],
-                provider_names=[],
-                env_vars={},
-                policy=None,
-                image="your-registry.example.com/opencode:latest",
-                tool_name="opencode",
-                model="google-vertex-anthropic/claude-sonnet-5@default",
-                model_setup_cmd="",
-                share_cmd="",
-                mcp_patch={},
-                repos_data=[],
-                git_username="",
-                pat_token="",
-                working_branch="",
-                agents_md="",
-                mode="prompt",
-                main_cmd="opencode run",
-                resolved_prompt="",
-                ephemeral_disk="5Gi",
-            )
-
-        call_kwargs = mock_create.call_args[1] if mock_create.call_args else {}
-        assert call_kwargs.get("ephemeral_storage") == "5Gi"
 
     @pytest.mark.asyncio
     async def test_sets_sandbox_name_on_session(self, client):
@@ -680,6 +563,28 @@ class TestDoLaunchOpenshell:
         mock_setup.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_passes_workspace_gateway_client_to_setup_task(self, client):
+        """Launch passes the selected workspace client through to setup unchanged."""
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+
+        patches = self._patch_openshell()
+        with patches["create_provider"], patches["ensure_provider"], \
+             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
+             patches["create_sandbox"], patches["write_agent_config"], \
+             patches["write_agents_md"], patches["exec_command"], \
+             patches["start_agent"], patches["delete_sandbox"], \
+             patches["build_policy"], patches["run_agent"], \
+             patches["setup_sandbox"] as mock_setup, \
+             patch("swarmer.openshell_client.get_client_for_workspace", new=AsyncMock(return_value=None)), \
+             patches["provider_exists"], patches["get_image"]:
+            await client.post(f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch")
+            await asyncio.sleep(0)
+
+        mock_setup.assert_called_once()
+        assert mock_setup.call_args.kwargs["client"] is None
+
+    @pytest.mark.asyncio
     async def test_uses_provider_api_not_env_vars_for_credentials(self, client):
         """AI credentials must flow through the gateway Provider API, not SandboxSpec.environment."""
         ws = await _create_workspace(client)
@@ -710,6 +615,186 @@ class TestDoLaunchOpenshell:
         assert mock_ensure.call_count == 0
         assert mock_cred.call_count == 0
         assert mock_attach.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_gemini_provider_attached_when_configured_on_gateway(self, client):
+        """When a google-ai-studio provider already exists on the gateway (created
+        via the secrets UI at save time, ACM-37263), it must be attached to the
+        sandbox's provider_names — the key is never read from the Swarmer DB at
+        launch time."""
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        expected_pname = f"swarmer-ws-{ws['id']}-google-ai-studio"
+
+        patches = self._patch_openshell()
+        with patches["create_provider"], \
+             patches["ensure_provider"] as mock_ensure, \
+             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
+             patches["create_sandbox"], patches["write_agent_config"], \
+             patches["write_agents_md"], patches["exec_command"], \
+             patches["start_agent"], patches["delete_sandbox"], \
+             patches["build_policy"], patches["run_agent"], \
+             patches["setup_sandbox"] as mock_setup, \
+             patches["get_image"]:
+            with patch(
+                "swarmer.openshell_client.provider_exists",
+                new=AsyncMock(side_effect=lambda name, **kw: name == expected_pname),
+            ):
+                await client.post(
+                    f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch"
+                )
+                await asyncio.sleep(0)
+
+        call_kwargs = mock_setup.call_args.kwargs if mock_setup.call_args else {}
+        assert expected_pname in call_kwargs.get("provider_names", []), (
+            f"Expected {expected_pname!r} in provider_names, got {call_kwargs.get('provider_names')}"
+        )
+        # Attaching an existing gateway provider must not call ensure_provider
+        # with a plaintext key sourced from the DB.
+        gemini_ensure_calls = [
+            c for c in mock_ensure.call_args_list
+            if len(c.args) >= 1 and c.args[0] == expected_pname
+        ]
+        assert gemini_ensure_calls == []
+
+    @pytest.mark.asyncio
+    async def test_gemini_provider_not_attached_when_absent_from_gateway(self, client):
+        """When no google-ai-studio provider exists on the gateway, it must not
+        be attached — no fallback to a DB-stored key at launch time."""
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        gemini_pname = f"swarmer-ws-{ws['id']}-google-ai-studio"
+
+        patches = self._patch_openshell()
+        with patches["create_provider"], patches["ensure_provider"], \
+             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
+             patches["create_sandbox"], patches["write_agent_config"], \
+             patches["write_agents_md"], patches["exec_command"], \
+             patches["start_agent"], patches["delete_sandbox"], \
+             patches["build_policy"], patches["run_agent"], \
+             patches["setup_sandbox"] as mock_setup, \
+              patches["get_image"]:
+            with patch(
+                "swarmer.openshell_client.provider_exists",
+                new=AsyncMock(side_effect=lambda name, **kw: name != gemini_pname),
+            ):
+                await client.post(
+                    f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch"
+                )
+                await asyncio.sleep(0)
+
+        call_kwargs = mock_setup.call_args.kwargs if mock_setup.call_args else {}
+        assert gemini_pname not in call_kwargs.get("provider_names", [])
+
+    @pytest.mark.asyncio
+    async def test_openai_provider_attached_when_configured_on_gateway(self, client):
+        """When an OpenAI provider exists on the gateway, attach it to the sandbox."""
+        ws = await _create_workspace(client)
+        s_resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/sessions",
+            json={"name": "s-openai", "mode": "prompt", "agent_tool": "opencode", "provider": "openai"},
+        )
+        assert s_resp.status_code == 201, s_resp.text
+        s = s_resp.json()
+        expected_pname = f"swarmer-ws-{ws['id']}-openai"
+
+        patches = self._patch_openshell()
+        with patches["create_provider"], \
+             patches["ensure_provider"] as mock_ensure, \
+             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
+             patches["create_sandbox"], patches["write_agent_config"], \
+             patches["write_agents_md"], patches["exec_command"], \
+             patches["start_agent"], patches["delete_sandbox"], \
+             patches["build_policy"], patches["run_agent"], \
+             patches["setup_sandbox"] as mock_setup, \
+             patches["get_image"]:
+            with patch(
+                "swarmer.openshell_client.provider_exists",
+                new=AsyncMock(side_effect=lambda name, **kw: name == expected_pname),
+            ):
+                await client.post(
+                    f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch"
+                )
+                await asyncio.sleep(0)
+
+        call_kwargs = mock_setup.call_args.kwargs if mock_setup.call_args else {}
+        assert expected_pname in call_kwargs.get("provider_names", []), (
+            f"Expected {expected_pname!r} in provider_names, got {call_kwargs.get('provider_names')}"
+        )
+        openai_ensure_calls = [
+            c for c in mock_ensure.call_args_list
+            if len(c.args) >= 1 and c.args[0] == expected_pname
+        ]
+        assert openai_ensure_calls == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_raw_model_selection_is_preserved(self, client):
+        """Existing sessions using raw model IDs must not be changed to a preset."""
+        ws = await _create_workspace(client)
+        raw_model = "google-vertex-anthropic/claude-sonnet-5@default"
+        s_resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/sessions",
+            json={
+                "name": "s-legacy-model",
+                "mode": "prompt",
+                "agent_tool": "opencode",
+                "provider": raw_model,
+            },
+        )
+        assert s_resp.status_code == 201, s_resp.text
+        s = s_resp.json()
+
+        patches = self._patch_openshell()
+        with patches["create_provider"], patches["ensure_provider"], \
+             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
+             patches["create_sandbox"], patches["write_agent_config"], \
+             patches["write_agents_md"], patches["exec_command"], \
+             patches["start_agent"], patches["delete_sandbox"], \
+             patches["build_policy"], patches["run_agent"], \
+             patches["setup_sandbox"] as mock_setup, patches["get_image"]:
+            with patch(
+                "swarmer.openshell_client.provider_exists",
+                new=AsyncMock(return_value=True),
+            ):
+                await client.post(
+                    f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch"
+                )
+                await asyncio.sleep(0)
+
+        assert mock_setup.call_args.kwargs["config_model"] == raw_model
+
+    @pytest.mark.asyncio
+    async def test_openai_provider_not_attached_when_absent_from_gateway(self, client):
+        """OpenAI model launches must fail early when the gateway provider is absent."""
+        ws = await _create_workspace(client)
+        s_resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/sessions",
+            json={"name": "s-openai-absent", "mode": "prompt", "agent_tool": "opencode", "provider": "openai"},
+        )
+        assert s_resp.status_code == 201, s_resp.text
+        s = s_resp.json()
+
+        patches = self._patch_openshell()
+        with patches["create_provider"], patches["ensure_provider"], \
+             patches["configure_provider_credential"], patches["attach_sandbox_provider"], \
+              patches["create_sandbox"], patches["write_agent_config"], \
+              patches["write_agents_md"], patches["exec_command"], \
+              patches["start_agent"], patches["delete_sandbox"], \
+              patches["build_policy"], patches["run_agent"], \
+              patches["setup_sandbox"] as mock_setup, \
+              patches["get_image"]:
+            with patch(
+                "swarmer.openshell_client.provider_exists",
+                new=AsyncMock(side_effect=lambda name, **kw: not name.endswith("-openai")),
+            ):
+                resp = await client.post(
+                    f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/launch"
+                )
+                await asyncio.sleep(0)
+
+        assert resp.status_code == 500
+        assert "OpenAI API key is not configured for this workspace" in resp.text
+        mock_setup.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_launch_blocked_when_github_repo_without_pat(self, client):
@@ -931,6 +1016,56 @@ class TestDoLaunchOpenshell:
             f"Expected no 'gh auth setup-git' call when no PAT is set, "
             f"got {len(setup_git_calls)}. All exec calls:\n" + "\n".join(all_cmds)
         )
+
+    @pytest.mark.asyncio
+    async def test_setup_uses_explicit_client_without_relookup(self, client):
+        from swarmer.routers.sessions import _setup_openshell_sandbox
+
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"], mode="prompt")
+
+        async with _TestSession() as db:
+            await db.execute(
+                text("UPDATE sessions SET phase='pending' WHERE id=:id"), {"id": s["id"]}
+            )
+            await db.commit()
+
+        ref = _fake_sandbox_ref("sandbox-explicit-client")
+        with patch("swarmer.database.get_db", new=_make_test_db_provider()), \
+             patch(
+                 "swarmer.openshell_client.get_client_for_workspace",
+                 new=AsyncMock(side_effect=AssertionError("unexpected client re-lookup")),
+             ), \
+             patch("swarmer.openshell_client.create_sandbox", new=AsyncMock(return_value=ref)), \
+             patch("swarmer.openshell_client.write_agent_config", new=AsyncMock()), \
+             patch("swarmer.openshell_client.write_agents_md", new=AsyncMock()), \
+             patch("swarmer.openshell_client.exec_command", new=AsyncMock(return_value=MagicMock(exit_code=0, stdout="", stderr=""))), \
+             patch("swarmer.routers.sessions._run_openshell_agent", new=AsyncMock()) as mock_run:
+            await _setup_openshell_sandbox(
+                session_id=s["id"],
+                workspace_id=ws["id"],
+                provider_names=[],
+                env_vars={},
+                policy=None,
+                image="quay.io/opencode:latest",
+                tool_name="opencode",
+                model="google-vertex-anthropic/claude-sonnet-5@default",
+                model_setup_cmd="",
+                share_cmd="",
+                mcp_patch={},
+                repos_data=[],
+                git_username="",
+                pat_token="",
+                working_branch="",
+                agents_md="",
+                mode="prompt",
+                main_cmd="opencode run",
+                resolved_prompt="",
+                client=None,
+            )
+
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["client"] is None
 
     @pytest.mark.asyncio
     async def test_repo_branch_checked_out_before_working_branch(self, client):
@@ -1575,6 +1710,56 @@ class TestRunOpenshellAgent:
         assert sess.phase == "failed"
 
     @pytest.mark.asyncio
+    async def test_prompt_mode_redacts_openai_key_in_opencode_output(self, client):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"], mode="prompt")
+
+        async with _TestSession() as db:
+            await db.execute(
+                text("UPDATE sessions SET sandbox_name='sandbox-redact', phase='pending' WHERE id=:id"),
+                {"id": s["id"]},
+            )
+            await db.commit()
+
+        sentinel = "top-secret-openai-value"
+
+        async def _fake_exec_streaming(_sandbox_name, _cmd, on_output=None, poll_interval=5.0, env=None):
+            if on_output is not None:
+                await on_output(f"stream OPENAI_API_KEY={sentinel}")
+            return MagicMock(exit_code=0, stdout="", stderr="")
+
+        with patch("swarmer.database.get_db", new=_make_test_db_provider()), \
+             patch("swarmer.openshell_client.exec_command_streaming", new=_fake_exec_streaming), \
+             patch(
+                 "swarmer.openshell_client.read_opencode_response",
+                 new=AsyncMock(return_value=f"final OPENAI_API_KEY={sentinel}"),
+             ), \
+             patch("swarmer.openshell_client.get_draft_chunks", new=AsyncMock(return_value=[])), \
+             patch("swarmer.openshell_client.delete_sandbox", new=AsyncMock()):
+            from swarmer.routers.sessions import _run_openshell_agent
+
+            await _run_openshell_agent(
+                s["id"],
+                ws["id"],
+                "sandbox-redact",
+                ["sh", "-c", "opencode run"],
+                "prompt",
+                "opencode",
+            )
+
+        async with _TestSession() as db:
+            from sqlalchemy import select
+            from swarmer.models.session import Session
+
+            sess = (await db.execute(select(Session).where(Session.id == s["id"]))).scalar_one()
+
+        assert sess.phase == "succeeded"
+        assert sentinel not in (sess.last_output or "")
+        assert sentinel not in (sess.raw_output or "")
+        assert "OPENAI_API_KEY=[REDACTED]" in (sess.last_output or "")
+        assert "OPENAI_API_KEY=[REDACTED]" in (sess.raw_output or "")
+
+    @pytest.mark.asyncio
     async def test_prompt_mode_auto_deletes_sandbox_on_success(self, client):
         ws = await _create_workspace(client)
         s = await _create_session(client, ws["id"], mode="prompt")
@@ -1602,6 +1787,46 @@ class TestRunOpenshellAgent:
             from swarmer.models.session import Session
             sess = (await db.execute(select(Session).where(Session.id == s["id"]))).scalar_one()
         assert sess.sandbox_name is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_mode_cleanup_uses_provided_client_without_relookup(self, client):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"], mode="prompt")
+
+        async with _TestSession() as db:
+            await db.execute(
+                text("UPDATE sessions SET sandbox_name='sandbox-autoclean', phase='pending' WHERE id=:id"),
+                {"id": s["id"]},
+            )
+            await db.commit()
+
+        exec_result = MagicMock(exit_code=0, stdout="done", stderr="")
+        with patch("swarmer.database.get_db", new=_make_test_db_provider()), \
+             patch(
+                 "swarmer.openshell_client.get_client_for_workspace",
+                 new=AsyncMock(side_effect=AssertionError("unexpected client re-lookup")),
+             ), \
+             patch("swarmer.openshell_client.exec_command_streaming", new=AsyncMock(return_value=exec_result)), \
+             patch("swarmer.openshell_client.read_opencode_response", new=AsyncMock(return_value="done")), \
+             patch("swarmer.openshell_client.get_draft_chunks", new=AsyncMock(return_value=[])), \
+             patch("swarmer.openshell_client.delete_sandbox", new=AsyncMock()) as mock_del, \
+             patch("swarmer.routers.sessions._delete_github_app_provider", new=AsyncMock()) as mock_del_app, \
+             patch("swarmer.routers.sessions._delete_pat_provider", new=AsyncMock()) as mock_del_pat:
+            from swarmer.routers.sessions import _run_openshell_agent
+            await _run_openshell_agent(
+                s["id"],
+                ws["id"],
+                "sandbox-autoclean",
+                ["sh", "-c", "opencode run"],
+                "prompt",
+                "opencode",
+                pat_id=77,
+                client=None,
+            )
+
+        mock_del.assert_called_once_with("sandbox-autoclean")
+        mock_del_app.assert_awaited_once_with(ws["id"], s["id"], client=None)
+        mock_del_pat.assert_awaited_once_with(ws["id"], 77, s["id"], client=None)
 
     @pytest.mark.asyncio
     async def test_prompt_mode_sets_phase_running_first(self, client):
@@ -1890,6 +2115,15 @@ class TestSessionDeleteOpenshell:
 
 
 class TestSandboxGC:
+    @pytest.fixture(autouse=True)
+    def gateway_for_age_checks(self, monkeypatch):
+        """Make age checks deterministic while exercising the real safety path."""
+        client = MagicMock()
+        response = MagicMock()
+        response.sandbox.metadata.created_at_ms = 0
+        client._stub.GetSandbox.return_value = response
+        monkeypatch.setattr("swarmer.openshell_client._get_client", lambda: client)
+
     @pytest.mark.asyncio
     async def test_deletes_sandbox_not_in_db(self):
         async with _TestSession() as db:
@@ -2996,4 +3230,3 @@ class TestPolicyRulesLiveApplyRevoke:
         assert trigger["policyChanged"]["live_revoked"] is False
         # Was called but returned 0 (startup rule, not in draft history).
         mock_undo.assert_awaited_once()
-

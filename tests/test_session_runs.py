@@ -1,5 +1,7 @@
 """Tests for session run history recording."""
 
+from __future__ import annotations
+
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -12,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from swarmer.database import Base
 from swarmer.models.session import Session
+from swarmer.models.workspace_prompt import WorkspacePrompt
 from swarmer.session_runs import STOPPED_BY_USER_DETAIL, record_session_run
 
 _engine = create_async_engine("sqlite+aiosqlite://", echo=False)
@@ -303,3 +306,263 @@ async def test_record_session_run_raw_output_defaults_empty():
 
         assert run is not None
         assert run.raw_output == ""
+
+
+async def _make_prompt(db, *, source_id: int, display_name: str) -> "WorkspacePrompt":
+    from swarmer.models.workspace_prompt import WorkspacePrompt
+
+    prompt = WorkspacePrompt(
+        source_id=source_id,
+        filename=f"{display_name}.md",
+        display_name=display_name,
+        content="do the thing",
+        content_hash="abc123",
+    )
+    db.add(prompt)
+    await db.flush()
+    return prompt
+
+
+async def _make_prompt_source(db, ws_id: int) -> int:
+    from swarmer.models.workspace_prompt import WorkspacePromptSource
+
+    source = WorkspacePromptSource(
+        workspace_id=ws_id,
+        name="prompts-repo",
+        repo_url="https://example.com/prompts.git",
+    )
+    db.add(source)
+    await db.flush()
+    return source.id
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_persists_mode():
+    """mode is snapshotted from the session at record time."""
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        session.mode = "tui"
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="stopped",
+            status_detail=STOPPED_BY_USER_DETAIL,
+            last_output="",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.mode == "tui"
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_mode_defaults_prompt():
+    """mode defaults to 'prompt' when the session has no mode set."""
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        session.mode = ""
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="",
+            last_output="done",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.mode == "prompt"
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_captures_session_prompt_when_no_schedule():
+    """Non-scheduled runs snapshot the session's own configured prompt."""
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        source_id = await _make_prompt_source(db, session.workspace_id)
+        prompt = await _make_prompt(db, source_id=source_id, display_name="Nightly Cleanup")
+        session.prompt_id = prompt.id
+        await db.flush()
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="",
+            last_output="done",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.schedule_label == ""
+        assert run.prompt_name == "Nightly Cleanup"
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_captures_active_schedule():
+    """Scheduled runs snapshot the schedule's label and its own prompt (overriding the session prompt)."""
+    from swarmer.models.session_schedule import SessionSchedule
+
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        source_id = await _make_prompt_source(db, session.workspace_id)
+        session_prompt = await _make_prompt(db, source_id=source_id, display_name="Default Prompt")
+        schedule_prompt = await _make_prompt(db, source_id=source_id, display_name="Nightly Prompt")
+        session.prompt_id = session_prompt.id
+
+        schedule = SessionSchedule(
+            session_id=session.id,
+            prompt_id=schedule_prompt.id,
+            cron_schedule="0 0 * * *",
+            label="Nightly Run",
+            enabled=True,
+        )
+        db.add(schedule)
+        await db.flush()
+        session.active_schedule_id = schedule.id
+        await db.commit()
+        await db.refresh(session)
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="",
+            last_output="done",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.schedule_label == "Nightly Run"
+        assert run.prompt_name == "Nightly Prompt"
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_event_trigger_captures_context():
+    """Event-triggered runs snapshot trigger_type='event' and preserve event_context."""
+    import json
+
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        session.event_context = json.dumps({"pr_number": 104, "event_condition": "ci_fail_or_conflict", "repo": "org/repo"})
+        await db.commit()
+        await db.refresh(session)
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="",
+            last_output="fixed it",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.trigger_type == "event"
+        assert run.schedule_label == "PR #104 (ci_fail_or_conflict)"
+        assert run.event_info.get("pr_number") == 104
+        assert run.event_info.get("event_condition") == "ci_fail_or_conflict"
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_cron_does_not_inherit_stale_event_context():
+    """ACM-42674 regression: a cron run following a prior event-triggered run on
+    the same session must NOT inherit the stale session.event_context — otherwise
+    Run History renders the '⚡ Event Context' drawer header on a cron entry."""
+    import json
+
+    from swarmer.models.session_schedule import SessionSchedule
+
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        # Simulate a prior event-triggered run having set event_context on the
+        # session row — session.event_context is never cleared after the run.
+        session.event_context = json.dumps({"pr_number": 104, "event_condition": "ci_fail_or_conflict"})
+
+        schedule = SessionSchedule(
+            session_id=session.id,
+            cron_schedule="0 9 * * 1-5",
+            label="Weekdays 9am",
+            trigger_type="cron",
+            enabled=True,
+        )
+        db.add(schedule)
+        await db.flush()
+        session.active_schedule_id = schedule.id
+        await db.commit()
+        await db.refresh(session)
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="",
+            last_output="cron output",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.trigger_type == "cron"
+        assert run.schedule_label == "Weekdays 9am"
+        assert run.event_context == ""
+        assert run.event_info == {}
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_manual_with_no_event_context_is_manual():
+    """A manual run (no active schedule, no event_context set) records as
+    trigger_type='manual', never 'event'. The launch-time clearing of stale
+    event_context (routers/sessions.py:session_launch and
+    api/v1/sessions.py:launch_session) is what prevents a manual UI/API
+    launch from inheriting a prior event run's context in the first place —
+    this test asserts the resulting snapshot once that clearing has happened."""
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+        session.event_context = ""
+        session.active_schedule_id = None
+        await db.commit()
+        await db.refresh(session)
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="",
+            last_output="manual output",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.trigger_type == "manual"
+        assert run.event_context == ""
+        assert run.event_info == {}
+
+
+@pytest.mark.asyncio
+async def test_record_session_run_no_prompt_or_schedule():
+    """Manual runs with no configured prompt leave schedule_label/prompt_name empty."""
+    async with _TestSession() as db:
+        session = await _make_prompt_session(db)
+
+        run = await record_session_run(
+            db,
+            session,
+            phase="succeeded",
+            status_detail="",
+            last_output="done",
+            completed_at=datetime.now(timezone.utc),
+        )
+        await db.commit()
+
+        assert run is not None
+        assert run.schedule_label == ""
+        assert run.prompt_name == ""

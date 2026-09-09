@@ -56,22 +56,7 @@ async def _setup_db(monkeypatch):
     orig_max = settings.max_concurrent_agents
     settings.k8s_namespace = ""
 
-    async def _all_accessible(token, namespaces, api_url, in_cluster):
-        return list(namespaces)
-
-    async def _can_create_namespaces(token, api_url, in_cluster):
-        return True
-
-    monkeypatch.setattr(
-        "swarmer.api.deps.get_accessible_namespaces", _all_accessible
-    )
-    monkeypatch.setattr(
-        "swarmer.api.v1.workspaces.can_create_namespaces", _can_create_namespaces
-    )
     monkeypatch.setattr("swarmer.k8s.ensure_namespace", lambda namespace: None)
-    monkeypatch.setattr(
-        "swarmer.k8s.grant_swarmer_user_access", lambda namespace, username: None
-    )
     monkeypatch.setattr("swarmer.k8s.delete_namespace", lambda namespace: None)
 
     import swarmer.models  # noqa: F401
@@ -977,6 +962,38 @@ class TestListPageLaunchModeCoercion:
         assert launched_modes == ["tui"], (
             f"Expected detail-page launch to preserve 'tui' mode, got {launched_modes}"
         )
+
+    @pytest.mark.asyncio
+    async def test_ui_launch_clears_stale_event_context(self, client):
+        """ACM-42674 regression: manually clicking Launch in the UI after a
+        prior event-triggered run must clear the stale session.event_context,
+        otherwise Run History mislabels the new manual run as event-driven."""
+        import json
+
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"], "manual-after-event-launch", mode="prompt")
+
+        from swarmer.models.session import Session
+
+        async with _TestSession() as db:
+            sess = await db.get(Session, s["id"])
+            sess.event_context = json.dumps({"pr_number": 104, "event_condition": "ci_fail_or_conflict"})
+            await db.commit()
+
+        async def _fake_do_launch(session, workspace, db, user_id=""):
+            pass
+
+        with patch("swarmer.routers.sessions._do_launch", new=_fake_do_launch):
+            resp = await client.post(
+                f"/workspaces/{ws['id']}/sessions/{s['id']}/launch",
+                data={"redirect_to": "list"},
+                follow_redirects=False,
+            )
+        assert resp.status_code in (302, 303)
+
+        async with _TestSession() as db:
+            sess = await db.get(Session, s["id"])
+            assert sess.event_context == ""
 
 
 # ===========================================================================

@@ -32,6 +32,17 @@ def _bin(path: str) -> dict:
 
 # ── Static base policy sections ───────────────────────────────────────────────
 
+# Filesystem policy applied to every sandbox regardless of agent tool.
+# Rationale:
+#   read_only  — system directories needed to run binaries and resolve
+#                libraries, but where the agent must not write (prevents
+#                tampering with the container OS or application code).
+#   read_write — /sandbox is the agent's working directory and primary
+#                output location; /tmp is required by many tools; /home/sandbox
+#                is the sandbox user's home; /dev/null is required for I/O
+#                redirection.
+#   include_workdir — ensures the sandbox's working directory (set per-session)
+#                is always accessible even if it falls outside the paths above.
 _BASE_FILESYSTEM = {
     "include_workdir": True,
     "read_only": ["/usr", "/lib", "/proc", "/dev/urandom", "/app", "/etc", "/var/log"],
@@ -103,6 +114,31 @@ _JIRA_MCP_BLOCK = {
         _bin("/sandbox/.venv/bin/python*"),
         # curl is used by smoke-test connectivity checks and shell tooling.
         _bin("/usr/bin/curl"),
+    ],
+}
+
+# Added when the workspace has SLACK_WEBHOOK_URL set. Agent prompts post
+# digests via curl or Python urllib; without this block the egress proxy
+# returns 403: CONNECT hooks.slack.com:443 not permitted by policy.
+_SLACK_WEBHOOK_BLOCK = {
+    "name": "slack-webhook",
+    "endpoints": [
+        {
+            # Literal host required at the CONNECT proxy layer (same pattern as
+            # redhat.atlassian.net — wildcards alone are unreliable there).
+            "host": "hooks.slack.com",
+            "port": 443,
+            "protocol": "rest",
+            "enforcement": "enforce",
+            "access": "full",
+        },
+    ],
+    "binaries": [
+        _bin("/usr/bin/curl"),
+        _bin("/usr/local/bin/python3.14"),
+        _bin("/usr/local/bin/python3"),
+        _bin("/usr/bin/python3"),
+        _bin("/sandbox/.venv/bin/python*"),
     ],
 }
 
@@ -312,6 +348,7 @@ def _endpoint(host: str) -> dict:
 def _build_agent_api_block(agent_tool: str, model: str) -> dict:
     _provider = model.split("/")[0] if "/" in model else ""
     _is_vertex = _provider in ("google-vertex-anthropic", "vertexai")
+    _is_openai = _provider == "openai"
 
     endpoints = [
         _endpoint("generativelanguage.googleapis.com"),
@@ -321,6 +358,8 @@ def _build_agent_api_block(agent_tool: str, model: str) -> dict:
     ]
     if _is_vertex:
         endpoints.append(_endpoint("aiplatform.googleapis.com"))
+    if _is_openai:
+        endpoints.append(_endpoint("api.openai.com"))
     block = {
         "name": "agent-api",
         "endpoints": endpoints,
@@ -340,6 +379,17 @@ def _build_agent_api_block(agent_tool: str, model: str) -> dict:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def slack_webhook_enabled(extra_env: dict[str, str] | None = None) -> bool:
+    """Return True when workspace env has a non-blank SLACK_WEBHOOK_URL.
+
+    Used by session launch to decide whether to attach the Slack webhook
+    egress block. Missing, empty, and whitespace-only values are False.
+    """
+    if not extra_env:
+        return False
+    return bool((extra_env.get("SLACK_WEBHOOK_URL") or "").strip())
+
+
 def build_session_policy(
     session,
     repos: list,
@@ -349,6 +399,7 @@ def build_session_policy(
     prompt_sources: list | None = None,
     custom_policies: list[dict] | None = None,
     has_google_cloud_provider: bool = False,
+    has_slack_webhook: bool = False,
 ):
     """Assemble a complete OpenShell SandboxPolicy proto for this session.
 
@@ -363,6 +414,9 @@ def build_session_policy(
     draft chunks.  These are merged into the static policy so approved rules
     take effect on the next sandbox launch without any code change.
 
+    has_slack_webhook: when True (workspace has SLACK_WEBHOOK_URL), grant
+    egress to hooks.slack.com for curl/python digest posts.
+
     Returns a SandboxPolicy proto object to be set on SandboxSpec.policy.
     """
     from google.protobuf.json_format import ParseDict
@@ -373,6 +427,7 @@ def build_session_policy(
         prompt_sources=prompt_sources,
         custom_policies=custom_policies,
         has_google_cloud_provider=has_google_cloud_provider,
+        has_slack_webhook=has_slack_webhook,
     )
 
     policy_dict = {
@@ -398,6 +453,7 @@ def build_session_network_policies(
     prompt_sources: list | None = None,
     custom_policies: list[dict] | None = None,
     has_google_cloud_provider: bool = False,
+    has_slack_webhook: bool = False,
 ) -> dict:
     """Return the computed network_policies dict for this session.
 
@@ -408,14 +464,26 @@ def build_session_network_policies(
     custom_policies: optional list of session-level rule dicts promoted from
     draft chunks.  Each entry is merged into the dict keyed by a slugified
     version of its "name" field (or "custom_{i}" as a fallback).
+
+    has_slack_webhook: when True, include hooks.slack.com egress for workspace
+    Slack Incoming Webhook posts (SLACK_WEBHOOK_URL).
     """
     network_policies_dict: dict = {}
-    network_policies_dict.update(_build_agent_api_block(agent_tool, model))
 
-    # Google Cloud provider: grant aiplatform.googleapis.com + api.github.com
-    # when the workspace's google-cloud provider is attached to this sandbox.
-    if has_google_cloud_provider:
-        network_policies_dict["google_cloud_provider"] = _build_google_cloud_provider_block(agent_tool)
+    # Non-AI tools (agent_tool reported as not requiring an AI model via
+    # AgentToolStrategy.requires_ai_model()) don't make model API calls, so we
+    # skip the agent API and Google Cloud egress blocks entirely.  Git, Jira,
+    # Slack, and any custom rules still apply below.
+    # Using the tool name here avoids importing the registry into this module;
+    # the canonical check is get_tool(agent_tool).requires_ai_model().
+    from swarmer.agent_tools.registry import get as _get_tool
+    if _get_tool(agent_tool).requires_ai_model():
+        network_policies_dict.update(_build_agent_api_block(agent_tool, model))
+
+        # Google Cloud provider: grant aiplatform.googleapis.com + api.github.com
+        # when the workspace's google-cloud provider is attached to this sandbox.
+        if has_google_cloud_provider:
+            network_policies_dict["google_cloud_provider"] = _build_google_cloud_provider_block(agent_tool)
 
     for repo in repos:
         slug = _repo_slug(repo)
@@ -425,6 +493,9 @@ def build_session_network_policies(
 
     if any("jira" in getattr(mcp, "slug", "") for mcp in (mcp_servers or [])):
         network_policies_dict["jira_mcp"] = _JIRA_MCP_BLOCK
+
+    if has_slack_webhook:
+        network_policies_dict["slack_webhook"] = _SLACK_WEBHOOK_BLOCK
 
     # Per-prompt-source raw.githubusercontent.com access.
     # Agents may curl prompt documents or files referenced within them from the
@@ -469,6 +540,8 @@ def build_session_network_policies(
             ep = dict(ep)
             if ep.get("protocol") and not ep.get("access") and not ep.get("rules"):
                 ep["access"] = "full"
+            if ep.get("host") == "registry.npmjs.org":
+                ep["allow_encoded_slash"] = True
             endpoints.append(ep)
         network_policies_dict[key] = {**rule, "endpoints": endpoints}
 

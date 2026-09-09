@@ -202,12 +202,12 @@ class APIClient:
         return [self._enrich_workspace(ws) for ws in result]
 
     async def create_workspace(
-        self, display_name: str, description: str = ""
+        self, display_name: str, description: str = "", gateway: dict | None = None
     ) -> dict:
-        ws = await self._post(
-            "/api/v1/workspaces",
-            json={"display_name": display_name, "description": description},
-        )
+        payload: dict[str, Any] = {"display_name": display_name, "description": description}
+        if gateway:
+            payload["gateway"] = gateway
+        ws = await self._post("/api/v1/workspaces", json=payload)
         return self._enrich_workspace(ws)
 
     async def get_workspace(self, ws_id: int) -> dict:
@@ -223,8 +223,74 @@ class APIClient:
         )
         return self._enrich_workspace(ws)
 
+    async def parse_gateway_command(self, command: str) -> dict:
+        return await self._post("/api/v1/workspaces/gateway/parse-command", json={"command": command})
+
+    async def parse_gateway_token(self, token_input: str) -> dict:
+        return await self._post("/api/v1/workspaces/gateway/parse-token", json={"token_input": token_input})
+
+    async def test_gateway_connection(self, gateway_data: dict) -> dict:
+        return await self._post("/api/v1/workspaces/gateway/test-connection", json=gateway_data)
+
+    async def get_workspace_gateway(self, ws_id: int) -> dict:
+        return await self._get(f"/api/v1/workspaces/{ws_id}/gateway")
+
+    async def set_workspace_gateway(self, ws_id: int, gateway_data: dict) -> dict:
+        return await self._post(f"/api/v1/workspaces/{ws_id}/gateway", json=gateway_data)
+
+    async def delete_workspace_gateway(self, ws_id: int) -> dict:
+        return await self._delete(f"/api/v1/workspaces/{ws_id}/gateway")
+
     async def delete_workspace(self, ws_id: int) -> dict:
         return await self._delete(f"/api/v1/workspaces/{ws_id}")
+
+    # ---------- Members (ACM-41659) — database-backed workspace ACL ----------
+
+    async def list_workspace_members(self, ws_id: int) -> list[dict]:
+        return await self._get(f"/api/v1/workspaces/{ws_id}/members")
+
+    async def add_workspace_member(
+        self, ws_id: int, user_id: str, role: str = "member"
+    ) -> dict:
+        return await self._post(
+            f"/api/v1/workspaces/{ws_id}/members",
+            json={"user_id": user_id, "role": role},
+        )
+
+    async def remove_workspace_member(self, ws_id: int, user_id: str) -> dict:
+        from urllib.parse import quote
+
+        return await self._delete(
+            f"/api/v1/workspaces/{ws_id}/members/{quote(user_id, safe='')}"
+        )
+
+    # ==================================================================
+    # Me / Global Admins (ACM-41659)
+    # ==================================================================
+
+    async def get_me(self) -> dict:
+        return await self._get("/api/v1/me")
+
+    async def list_admins(self) -> list[dict]:
+        return await self._get("/api/v1/admins")
+
+    async def add_admin(self, user_id: str) -> dict:
+        return await self._post("/api/v1/admins", json={"user_id": user_id})
+
+    async def remove_admin(self, user_id: str) -> dict:
+        from urllib.parse import quote
+
+        return await self._delete(f"/api/v1/admins/{quote(user_id, safe='')}")
+
+    async def bootstrap_admin(self) -> dict:
+        return await self._post("/api/v1/admins/bootstrap")
+
+    async def list_known_users(self) -> list[str]:
+        """Autocomplete suggestions for Add Member / Add Admin forms —
+        visibility-scoped (see workspace_acl.list_known_users()), never a
+        global user directory."""
+        result = await self._get("/api/v1/users")
+        return list(result.get("users", []))
 
     # ==================================================================
     # Sessions
@@ -387,8 +453,12 @@ class APIClient:
         google_cloud_project: str = "",
         vertex_location: str = "",
         google_api_key: str = "",
+        openai_api_key: str = "",
         application_default_credentials: str = "",
         shared: bool = False,
+        gemini_configured: bool | None = None,
+        openai_configured: bool | None = None,
+        vertex_configured: bool | None = None,
     ) -> dict:
         return await self._post(
             f"/api/v1/workspaces/{ws_id}/secrets/credentials",
@@ -396,9 +466,18 @@ class APIClient:
                 "google_cloud_project": google_cloud_project,
                 "vertex_location": vertex_location,
                 "google_api_key": google_api_key,
+                "openai_api_key": openai_api_key,
                 "application_default_credentials": application_default_credentials,
                 "shared": shared,
+                "gemini_configured": gemini_configured,
+                "openai_configured": openai_configured,
+                "vertex_configured": vertex_configured,
             },
+        )
+
+    async def delete_credential(self, ws_id: int, provider: str) -> dict:
+        return await self._delete(
+            f"/api/v1/workspaces/{ws_id}/secrets/credentials/{provider}"
         )
 
     async def get_github_app(self, ws_id: int) -> dict | None:

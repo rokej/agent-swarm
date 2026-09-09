@@ -68,16 +68,7 @@ async def _setup_db(monkeypatch):
     orig_ns = settings.k8s_namespace
     settings.k8s_namespace = ""  # must be empty to allow workspace creation
 
-    async def _all_accessible(token, namespaces, api_url, in_cluster):
-        return list(namespaces)
-
-    async def _can_create_namespaces(token, api_url, in_cluster):
-        return True
-
-    monkeypatch.setattr("swarmer.api.deps.get_accessible_namespaces", _all_accessible)
-    monkeypatch.setattr("swarmer.api.v1.workspaces.can_create_namespaces", _can_create_namespaces)
     monkeypatch.setattr("swarmer.k8s.ensure_namespace", lambda namespace: None)
-    monkeypatch.setattr("swarmer.k8s.grant_swarmer_user_access", lambda namespace, username: None)
     monkeypatch.setattr("swarmer.k8s.delete_namespace", lambda namespace: None)
 
     import swarmer.models  # noqa: F401
@@ -127,6 +118,32 @@ async def _create_session(client: AsyncClient, ws_id: int, name: str = "s1") -> 
     return resp.json()
 
 
+async def _create_prompt(ws_id: int, name: str = "Test Prompt") -> int:
+    from swarmer.models.workspace_prompt import WorkspacePrompt, WorkspacePromptSource
+
+    async with _TestSession() as db:
+        source = WorkspacePromptSource(
+            workspace_id=ws_id,
+            name=f"source-{name}",
+            repo_url="https://example.com/prompts",
+            branch="main",
+        )
+        db.add(source)
+        await db.commit()
+        await db.refresh(source)
+        prompt = WorkspacePrompt(
+            source_id=source.id,
+            filename=f"{name}.md",
+            display_name=name,
+            content="Run the requested task.",
+            content_hash=name,
+        )
+        db.add(prompt)
+        await db.commit()
+        await db.refresh(prompt)
+        return prompt.id
+
+
 # ===========================================================================
 # Model-level tests (direct DB access via ORM)
 # ===========================================================================
@@ -165,6 +182,7 @@ class TestSessionScheduleModel:
             assert sched.session_id == session.id
             assert sched.cron_schedule == "0 * * * *"
             assert sched.label == "hourly"
+            assert sched.include_event_context is True
             assert sched.enabled is True
 
     @pytest.mark.asyncio
@@ -247,6 +265,137 @@ class TestSessionScheduleModel:
             await db.refresh(session)
             assert session.earliest_next_run == soon
 
+    @pytest.mark.asyncio
+    async def test_active_schedule_property(self):
+        """Session.active_schedule resolves active_schedule_id to the
+        matching (eager-loaded) SessionSchedule, or None."""
+        from swarmer.models.session import Session
+        from swarmer.models.session_schedule import SessionSchedule
+        from swarmer.models.workspace import Workspace
+
+        async with _TestSession() as db:
+            ws = Workspace(display_name="WS4", namespace="ws4", description="")
+            db.add(ws)
+            await db.commit()
+            await db.refresh(ws)
+
+            session = Session(workspace_id=ws.id, name="s4", mode="prompt",
+                              provider="", agent_tool="opencode", instruction_prompt="")
+            db.add(session)
+            await db.commit()
+            await db.refresh(session)
+
+            s1 = SessionSchedule(session_id=session.id, cron_schedule="0 * * * *", label="hourly")
+            s2 = SessionSchedule(session_id=session.id, cron_schedule="0 0 * * *", label="daily")
+            db.add_all([s1, s2])
+            await db.commit()
+            await db.refresh(s2)
+
+            # No active schedule yet.
+            await db.refresh(session)
+            assert session.active_schedule is None
+
+            session.active_schedule_id = s2.id
+            await db.commit()
+            await db.refresh(session)
+            assert session.active_schedule is not None
+            assert session.active_schedule.id == s2.id
+            assert session.active_schedule.label == "daily"
+
+            # Stale/unknown id resolves to None rather than raising.
+            session.active_schedule_id = 999999
+            await db.commit()
+            await db.refresh(session)
+            assert session.active_schedule is None
+
+
+class TestSessionHasPendingChunks:
+    """Unit tests for Session.has_pending_chunks (ACM-39209)."""
+
+    def _session(self, *, policy_chunks: str = "", custom_policies: str = ""):
+        from swarmer.models.session import Session
+        return Session(
+            workspace_id=1, name="s", mode="prompt", provider="",
+            agent_tool="opencode", instruction_prompt="",
+            policy_chunks=policy_chunks, custom_policies=custom_policies,
+        )
+
+    def test_no_chunks_recorded(self):
+        assert self._session().has_pending_chunks is False
+
+    def test_invalid_json_is_falsy(self):
+        assert self._session(policy_chunks="not json").has_pending_chunks is False
+
+    def test_malformed_chunk_alone_is_not_pending(self):
+        """A list containing only non-dict entries must not raise AttributeError,
+        and with nothing valid to flag, must not be considered pending."""
+        import json
+        chunks = json.dumps(["not a dict"])
+        assert self._session(policy_chunks=chunks).has_pending_chunks is False
+
+    def test_malformed_chunk_ignored(self):
+        """A non-dict entry mixed with a valid pending chunk must not raise
+        AttributeError, and traversal must continue to detect the valid entry."""
+        import json
+        chunks = json.dumps(["not a dict", {"status": "pending", "rule_name": "r1", "binaries": []}])
+        assert self._session(policy_chunks=chunks).has_pending_chunks is True
+
+    def test_null_binaries_chunk_alone_is_pending(self):
+        """A chunk with `"binaries": null` must not raise TypeError. Its null
+        binaries are treated as empty, which is fully uncovered → pending."""
+        import json
+        chunks = json.dumps([
+            {"status": "pending", "rule_name": "r1", "binaries": None},
+        ])
+        assert self._session(policy_chunks=chunks).has_pending_chunks is True
+
+    def test_null_binaries_in_chunk_does_not_crash(self):
+        """A chunk with `"binaries": null` mixed with another valid pending
+        chunk must not abort the loop via TypeError."""
+        import json
+        chunks = json.dumps([
+            {"status": "pending", "rule_name": "r1", "binaries": None},
+            {"status": "pending", "rule_name": "r2", "binaries": [{"path": "/usr/bin/curl"}]},
+        ])
+        # r1's null binaries yields an empty set → fully covered by nothing → pending.
+        assert self._session(policy_chunks=chunks).has_pending_chunks is True
+
+    def test_pending_chunk_not_yet_promoted(self):
+        import json
+        chunks = json.dumps([
+            {"status": "pending", "rule_name": "r1", "binaries": [{"path": "/usr/bin/curl"}]},
+        ])
+        assert self._session(policy_chunks=chunks).has_pending_chunks is True
+
+    def test_approved_chunk_not_pending(self):
+        import json
+        chunks = json.dumps([
+            {"status": "approved", "rule_name": "r1", "binaries": [{"path": "/usr/bin/curl"}]},
+        ])
+        assert self._session(policy_chunks=chunks).has_pending_chunks is False
+
+    def test_pending_chunk_fully_promoted_not_pending(self):
+        import json
+        chunks = json.dumps([
+            {"status": "pending", "rule_name": "r1", "binaries": [{"path": "/usr/bin/curl"}]},
+        ])
+        custom = json.dumps([
+            {"name": "r1", "binaries": [{"path": "/usr/bin/curl"}]},
+        ])
+        assert self._session(policy_chunks=chunks, custom_policies=custom).has_pending_chunks is False
+
+    def test_pending_chunk_partially_promoted_still_pending(self):
+        """Same rule_name promoted for a different binary — chunk's binary
+        isn't covered, so it's still pending."""
+        import json
+        chunks = json.dumps([
+            {"status": "pending", "rule_name": "r1", "binaries": [{"path": "/usr/bin/curl"}]},
+        ])
+        custom = json.dumps([
+            {"name": "r1", "binaries": [{"path": "/usr/bin/wget"}]},
+        ])
+        assert self._session(policy_chunks=chunks, custom_policies=custom).has_pending_chunks is True
+
 
 # ===========================================================================
 # API tests: /schedules sub-resource
@@ -292,7 +441,7 @@ class TestSessionDetailPageWithSchedulePrompt:
         async with _TestSession() as db:
             source = WorkspacePromptSource(
                 workspace_id=other_ws["id"], name="src1",
-                repo_url="https://github.com/x/y", branch="main",
+                repo_url="https://example.com/repo", branch="main",
             )
             db.add(source)
             await db.commit()
@@ -317,17 +466,251 @@ class TestSessionDetailPageWithSchedulePrompt:
         assert resp.status_code == 200, resp.text
 
 
+class TestScheduleAndPendingChunksIndicators:
+    """Regression coverage for ACM-39209 UI indicators:
+    - running-from-schedule badge (session name/prompt) on the session
+      list rows and workspace-scoped session table
+    - pending net rules dot on the same views
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def _patch_auth(self):
+        from swarmer.deps import require_auth
+        from swarmer.main import app
+        app.dependency_overrides[require_auth] = lambda: None
+        yield
+        app.dependency_overrides.pop(require_auth, None)
+
+    @pytest.mark.asyncio
+    async def test_list_rows_shows_active_schedule_badge_and_pending_dot(self, client):
+        import json
+        from swarmer.models.session import Session
+        from swarmer.models.session_schedule import SessionSchedule
+        from swarmer.models.workspace_prompt import WorkspacePrompt, WorkspacePromptSource
+
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        ws_id, sid = ws["id"], s["id"]
+
+        async with _TestSession() as db:
+            source = WorkspacePromptSource(
+                workspace_id=ws_id, name="src1",
+                repo_url="https://example.com/repo", branch="main",
+            )
+            db.add(source)
+            await db.commit()
+            await db.refresh(source)
+
+            prompt = WorkspacePrompt(
+                source_id=source.id, filename="p.md", display_name="Nightly CVE Scan",
+                content="hi", content_hash="h1",
+            )
+            db.add(prompt)
+            await db.commit()
+            await db.refresh(prompt)
+
+            sched = SessionSchedule(
+                session_id=sid, cron_schedule="0 2 * * *",
+                enabled=True, label="Nightly", prompt_id=prompt.id,
+            )
+            db.add(sched)
+            await db.commit()
+            await db.refresh(sched)
+
+            session = await db.get(Session, sid)
+            session.phase = "running"
+            session.active_schedule_id = sched.id
+            session.policy_chunks = json.dumps([
+                {"status": "pending", "rule_name": "r1", "binaries": [{"path": "/usr/bin/curl"}]},
+            ])
+            await db.commit()
+
+        resp = await client.get(f"/workspaces/{ws_id}/sessions/rows")
+        assert resp.status_code == 200, resp.text
+        html = resp.text
+        assert "Nightly" in html
+        assert "Nightly CVE Scan" in html
+        assert "pending-net-rules-dot" in html
+
+    @pytest.mark.asyncio
+    async def test_list_rows_no_indicators_when_idle_and_no_pending(self, client):
+        ws = await _create_workspace(client)
+        await _create_session(client, ws["id"])
+        ws_id = ws["id"]
+
+        resp = await client.get(f"/workspaces/{ws_id}/sessions/rows")
+        assert resp.status_code == 200, resp.text
+        html = resp.text
+        assert "pending-net-rules-dot" not in html
+        assert "Triggered by scheduled run" not in html
+
+
+class TestScheduleEditHTMXEndpoint:
+    """Regression test for ACM-39209.
+
+    The HTMX inline-edit form (sessions/_schedule_items.html) has no
+    `enabled` checkbox — enable/disable is handled exclusively by the
+    separate `schedule_toggle` endpoint. `schedule_edit()` previously
+    declared `enabled: str = Form("")` and unconditionally set
+    `sched.enabled = (enabled == "on")`, which forced every edit to
+    silently disable the schedule regardless of its prior state.
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def _patch_auth(self):
+        from swarmer.deps import require_auth
+        from swarmer.main import app
+        app.dependency_overrides[require_auth] = lambda: None
+        yield
+        app.dependency_overrides.pop(require_auth, None)
+
+    @pytest.mark.asyncio
+    async def test_edit_preserves_enabled_state(self, client):
+        from swarmer.models.session_schedule import SessionSchedule
+
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        ws_id, sid = ws["id"], s["id"]
+        prompt_id = await _create_prompt(ws_id)
+
+        async with _TestSession() as db:
+            sched = SessionSchedule(
+                session_id=sid, cron_schedule="0 * * * *",
+                enabled=True, label="hourly", prompt_id=prompt_id,
+            )
+            db.add(sched)
+            await db.commit()
+            await db.refresh(sched)
+            sched_id = sched.id
+
+        resp = await client.post(
+            f"/workspaces/{ws_id}/sessions/{sid}/schedules/{sched_id}/edit",
+            data={
+                "cron_expr": "0 0 * * *",
+                "label": "daily",
+                "prompt_id": str(prompt_id),
+                "instruction_prompt": "",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        async with _TestSession() as db:
+            updated = await db.get(SessionSchedule, sched_id)
+            assert updated.cron_schedule == "0 0 * * *"
+            assert updated.label == "daily"
+            assert updated.enabled is True
+
+    @pytest.mark.asyncio
+    async def test_edit_preserves_disabled_state(self, client):
+        from swarmer.models.session_schedule import SessionSchedule
+
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        ws_id, sid = ws["id"], s["id"]
+        prompt_id = await _create_prompt(ws_id)
+
+        async with _TestSession() as db:
+            sched = SessionSchedule(
+                session_id=sid, cron_schedule="0 * * * *",
+                enabled=False, label="hourly", prompt_id=prompt_id,
+            )
+            db.add(sched)
+            await db.commit()
+            await db.refresh(sched)
+            sched_id = sched.id
+
+        resp = await client.post(
+            f"/workspaces/{ws_id}/sessions/{sid}/schedules/{sched_id}/edit",
+            data={
+                "cron_expr": "0 0 * * *",
+                "label": "daily",
+                "prompt_id": str(prompt_id),
+                "instruction_prompt": "",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        async with _TestSession() as db:
+            updated = await db.get(SessionSchedule, sched_id)
+            assert updated.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_schedule_items_include_context_checkbox_and_stable_cancel_target(self, client):
+        from swarmer.models.session_schedule import SessionSchedule
+
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
+
+        async with _TestSession() as db:
+            sched = SessionSchedule(
+                session_id=s["id"], trigger_type="event",
+                event_condition="new_pr_or_commit", label="PR review", prompt_id=prompt_id,
+            )
+            db.add(sched)
+            await db.commit()
+            await db.refresh(sched)
+
+        resp = await client.get(
+            f"/workspaces/{ws['id']}/sessions/{s['id']}/schedules/items"
+        )
+        assert resp.status_code == 200, resp.text
+        assert f'id="sched-edit-btn-{sched.id}"' in resp.text
+        assert "document.getElementById('sched-edit-btn-" in resp.text
+        assert 'name="include_event_context"' in resp.text
+        assert "value=\"1\" checked" in resp.text
+        assert "schedule-help-popover" in resp.text
+        assert 'Prompt <span' in resp.text
+
+    @pytest.mark.asyncio
+    async def test_edit_can_disable_event_context(self, client):
+        from swarmer.models.session_schedule import SessionSchedule
+
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
+
+        async with _TestSession() as db:
+            sched = SessionSchedule(
+                session_id=s["id"], trigger_type="event",
+                event_condition="new_pr_or_commit", include_event_context=True, prompt_id=prompt_id,
+            )
+            db.add(sched)
+            await db.commit()
+            await db.refresh(sched)
+            sched_id = sched.id
+
+        resp = await client.post(
+            f"/workspaces/{ws['id']}/sessions/{s['id']}/schedules/{sched_id}/edit",
+            data={
+                "trigger_type": "event",
+                "event_condition": "new_pr_or_commit",
+                "author_scope": "all",
+                "cron_expr": "",
+                "label": "PR review",
+                "prompt_id": str(prompt_id),
+                "instruction_prompt": "",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        async with _TestSession() as db:
+            updated = await db.get(SessionSchedule, sched_id)
+            assert updated.include_event_context is False
+
+
 class TestScheduleAPI:
     @pytest.mark.asyncio
     async def test_create_and_list(self, client):
         ws = await _create_workspace(client)
         s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
         ws_id, sid = ws["id"], s["id"]
 
         # Create a schedule
         resp = await client.post(
             f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules",
-            json={"cron_schedule": "0 * * * *", "label": "hourly"},
+            json={"cron_schedule": "0 * * * *", "label": "hourly", "prompt_id": prompt_id},
         )
         assert resp.status_code == 201, resp.text
         sched = resp.json()
@@ -347,11 +730,12 @@ class TestScheduleAPI:
     async def test_update_schedule(self, client):
         ws = await _create_workspace(client)
         s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
         ws_id, sid = ws["id"], s["id"]
 
         resp = await client.post(
             f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules",
-            json={"cron_schedule": "0 * * * *"},
+            json={"cron_schedule": "0 * * * *", "prompt_id": prompt_id},
         )
         sched_id = resp.json()["id"]
 
@@ -366,14 +750,43 @@ class TestScheduleAPI:
         assert updated["enabled"] is False
 
     @pytest.mark.asyncio
-    async def test_delete_schedule(self, client):
+    async def test_event_context_option_round_trip(self, client):
         ws = await _create_workspace(client)
         s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
         ws_id, sid = ws["id"], s["id"]
 
         resp = await client.post(
             f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules",
-            json={"cron_schedule": "*/30 * * * *"},
+            json={
+                "trigger_type": "event",
+                "event_condition": "new_pr_or_commit",
+                "include_event_context": True,
+                "prompt_id": prompt_id,
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        sched = resp.json()
+        assert sched["include_event_context"] is True
+
+        resp = await client.put(
+            f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules/{sched['id']}",
+            json={"include_event_context": False},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["include_event_context"] is False
+
+
+    @pytest.mark.asyncio
+    async def test_delete_schedule(self, client):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
+        ws_id, sid = ws["id"], s["id"]
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules",
+            json={"cron_schedule": "*/30 * * * *", "prompt_id": prompt_id},
         )
         sched_id = resp.json()["id"]
 
@@ -398,14 +811,33 @@ class TestScheduleAPI:
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_session_out_includes_schedules(self, client):
+    async def test_schedule_requires_prompt(self, client):
         ws = await _create_workspace(client)
         s = await _create_session(client, ws["id"])
         ws_id, sid = ws["id"], s["id"]
 
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules",
+            json={"cron_schedule": "0 * * * *"},
+        )
+        assert resp.status_code == 422
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules",
+            json={"trigger_type": "event", "event_condition": "new_pr_or_commit"},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_session_out_includes_schedules(self, client):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
+        ws_id, sid = ws["id"], s["id"]
+
         await client.post(
             f"/api/v1/workspaces/{ws_id}/sessions/{sid}/schedules",
-            json={"cron_schedule": "0 * * * *", "label": "hourly"},
+            json={"cron_schedule": "0 * * * *", "label": "hourly", "prompt_id": prompt_id},
         )
 
         resp = await client.get(f"/api/v1/workspaces/{ws_id}/sessions/{sid}")
@@ -435,6 +867,86 @@ class TestScheduleAPI:
 
 
 # ===========================================================================
+# Prompt resolution tests
+# ===========================================================================
+
+
+class TestSchedulePromptEventContext:
+    @pytest.mark.asyncio
+    async def test_event_context_is_appended_when_enabled(self):
+        import json
+        from swarmer.models.session import Session
+        from swarmer.models.session_schedule import SessionSchedule
+        from swarmer.models.workspace import Workspace
+        from swarmer.routers.sessions import _resolve_schedule_prompt
+
+        async with _TestSession() as db:
+            ws = Workspace(display_name="Prompt WS", namespace="prompt-ws", description="")
+            db.add(ws)
+            await db.commit()
+            await db.refresh(ws)
+            session = Session(
+                workspace_id=ws.id, name="prompt-session", mode="prompt",
+                provider="", agent_tool="opencode", instruction_prompt="Review this.",
+                event_context=json.dumps({
+                    "trigger_type": "event", "repo": "org/repo", "pr_number": 42,
+                    "action": "ci_failed", "cause": "checks failed",
+                }),
+            )
+            db.add(session)
+            await db.commit()
+            await db.refresh(session)
+            sched = SessionSchedule(
+                session_id=session.id, trigger_type="event",
+                include_event_context=True,
+            )
+            db.add(sched)
+            await db.commit()
+            await db.refresh(sched)
+
+            prompt = await _resolve_schedule_prompt(sched.id, session, db)
+
+        assert "Review this." in prompt
+        assert "## GitHub Event Context" in prompt
+        assert '"pr_number": 42' in prompt
+        assert '"repo": "org/repo"' in prompt
+
+    @pytest.mark.asyncio
+    async def test_event_context_is_omitted_when_disabled(self):
+        import json
+        from swarmer.models.session import Session
+        from swarmer.models.session_schedule import SessionSchedule
+        from swarmer.models.workspace import Workspace
+        from swarmer.routers.sessions import _resolve_schedule_prompt
+
+        async with _TestSession() as db:
+            ws = Workspace(display_name="Prompt WS 2", namespace="prompt-ws-2", description="")
+            db.add(ws)
+            await db.commit()
+            await db.refresh(ws)
+            session = Session(
+                workspace_id=ws.id, name="prompt-session-2", mode="prompt",
+                provider="", agent_tool="opencode", instruction_prompt="Review this.",
+                event_context=json.dumps({"pr_number": 42}),
+            )
+            db.add(session)
+            await db.commit()
+            await db.refresh(session)
+            sched = SessionSchedule(
+                session_id=session.id, trigger_type="event",
+                include_event_context=False,
+            )
+            db.add(sched)
+            await db.commit()
+            await db.refresh(sched)
+
+            prompt = await _resolve_schedule_prompt(sched.id, session, db)
+
+        assert "## GitHub Event Context" not in prompt
+        assert "pr_number" not in prompt
+
+
+# ===========================================================================
 # Scheduler tests: multi-schedule queuing
 # ===========================================================================
 
@@ -443,7 +955,6 @@ class TestSchedulerMultiSchedule:
     @pytest.mark.asyncio
     async def test_only_one_due_schedule_fires_per_poll(self):
         """Two due schedules for the same session: only the earliest fires per poll."""
-        from sqlalchemy import select
         from swarmer.models.session import Session
         from swarmer.models.session_schedule import SessionSchedule
         from swarmer.models.workspace import Workspace
@@ -454,7 +965,6 @@ class TestSchedulerMultiSchedule:
         async def _fake_launch(session, ws, db):
             launched.append((session.id, session.active_schedule_id))
 
-        import swarmer.scheduler as _sched_mod
         import swarmer.routers.sessions as _sess_mod
         original_do_launch = getattr(_sess_mod, "_do_launch", None)
 
@@ -526,6 +1036,190 @@ class TestSchedulerMultiSchedule:
 
 
 # ===========================================================================
+# Event triggers and cron-to-event conversion tests (ACM-42674)
+# ===========================================================================
+
+
+class TestEventTriggers:
+    @pytest.mark.asyncio
+    async def test_create_event_trigger_api(self, client: AsyncClient):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
+        ws_id = ws["id"]
+        s_id = s["id"]
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/schedules",
+            json={
+                "trigger_type": "event",
+                "event_condition": "ci_fail_or_conflict",
+                "author_scope": "self",
+                "label": "Auto-fix my PRs",
+                "prompt_id": prompt_id,
+            },
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["trigger_type"] == "event"
+        assert data["event_condition"] == "ci_fail_or_conflict"
+        assert data["author_scope"] == "self"
+        assert data["cron_schedule"] == ""
+        assert data["cron_next_run"] is None
+        assert data["label"] == "Auto-fix my PRs"
+
+    @pytest.mark.asyncio
+    async def test_create_event_trigger_with_fix_authors(self, client: AsyncClient):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
+        ws_id = ws["id"]
+        s_id = s["id"]
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/schedules",
+            json={
+                "trigger_type": "event",
+                "event_condition": "any_actionable",
+                "author_scope": "self",
+                "fix_authors": "bob, alice",
+                "label": "My PR Fixes",
+                "prompt_id": prompt_id,
+            },
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["trigger_type"] == "event"
+        assert data["author_scope"] == "self"
+        assert data["fix_authors"] == "bob, alice"
+
+    @pytest.mark.asyncio
+    async def test_launch_without_context_clears_event_context(self, client: AsyncClient):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        ws_id = ws["id"]
+        s_id = s["id"]
+
+        from unittest.mock import AsyncMock, patch
+
+        with patch("swarmer.routers.sessions._do_launch", new_callable=AsyncMock):
+            # 1. Launch with event context
+            resp1 = await client.post(
+                f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/launch",
+                json={"pr_context": {"pr_number": 99}},
+            )
+            assert resp1.status_code == 200
+
+            # 2. Later launch without context
+            resp2 = await client.post(
+                f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/launch",
+                json={},
+            )
+            assert resp2.status_code == 200
+
+            async with _TestSession() as session:
+                from swarmer.models.session import Session
+                s_obj = await session.get(Session, s_id)
+                assert s_obj.event_context == ""
+
+    @pytest.mark.asyncio
+    async def test_convert_cron_to_event_trigger_api(self, client: AsyncClient):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        prompt_id = await _create_prompt(ws["id"])
+        ws_id = ws["id"]
+        s_id = s["id"]
+
+        # 1. Create cron schedule
+        create_resp = await client.post(
+            f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/schedules",
+            json={"cron_schedule": "0 9 * * 1-5", "label": "Morning Cron", "prompt_id": prompt_id},
+        )
+        assert create_resp.status_code == 201
+        sched_id = create_resp.json()["id"]
+
+        # 2. Convert to event trigger
+        update_resp = await client.put(
+            f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/schedules/{sched_id}",
+            json={
+                "trigger_type": "event",
+                "event_condition": "new_pr_or_commit",
+                "author_scope": "team",
+                "label": "Review Team PRs",
+            },
+        )
+        assert update_resp.status_code == 200
+        updated = update_resp.json()
+        assert updated["trigger_type"] == "event"
+        assert updated["event_condition"] == "new_pr_or_commit"
+        assert updated["author_scope"] == "team"
+        assert updated["cron_schedule"] == ""
+        assert updated["cron_next_run"] is None
+
+        # 3. Convert back to cron schedule
+        revert_resp = await client.put(
+            f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/schedules/{sched_id}",
+            json={
+                "trigger_type": "cron",
+                "cron_schedule": "*/15 * * * *",
+                "label": "15min Cron",
+            },
+        )
+        assert revert_resp.status_code == 200
+        reverted = revert_resp.json()
+        assert reverted["trigger_type"] == "cron"
+        assert reverted["cron_schedule"] == "*/15 * * * *"
+        assert reverted["cron_next_run"] is not None
+
+    @pytest.mark.asyncio
+    async def test_launch_with_pr_context_and_run_history(self, client: AsyncClient):
+        ws = await _create_workspace(client)
+        s = await _create_session(client, ws["id"])
+        ws_id = ws["id"]
+        s_id = s["id"]
+
+        from unittest.mock import AsyncMock, patch
+
+        pr_payload = {
+            "repo": "stolostron/agent-swarm",
+            "pr_number": 104,
+            "head_sha": "7f3a8b1c",
+            "event_condition": "ci_fail_or_conflict",
+            "title": "fix: update scheduler",
+        }
+
+        with patch("swarmer.routers.sessions._do_launch", new_callable=AsyncMock) as mock_launch:
+            resp = await client.post(
+                f"/api/v1/workspaces/{ws_id}/sessions/{s_id}/launch",
+                json={"pr_context": pr_payload},
+            )
+            assert resp.status_code == 200
+            mock_launch.assert_called_once()
+
+            # Verify event context is captured on session
+            async with _TestSession() as session:
+                from swarmer.models.session import Session
+                s_obj = await session.get(Session, s_id)
+                assert "104" in s_obj.event_context
+
+                # Test recording session run with event context
+                from swarmer.session_runs import record_session_run
+                s_obj.run_started_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+                run = await record_session_run(
+                    session,
+                    s_obj,
+                    phase="succeeded",
+                    status_detail="Fixed 2 checks",
+                    last_output="All tests passed",
+                    completed_at=datetime.now(timezone.utc),
+                )
+                assert run is not None
+                assert run.trigger_type == "event"
+                assert run.schedule_label == "PR #104 (ci_fail_or_conflict)"
+                assert run.event_info.get("pr_number") == 104
+
+
+# ===========================================================================
 # MCP server schedule tool tests
 # ===========================================================================
 
@@ -546,8 +1240,9 @@ class TestMCPScheduleTools:
             "cron_schedule": "0 * * * *",
             "cron_next_run": "2026-06-16T00:00:00",
             "label": "hourly",
-            "prompt_id": None,
+            "prompt_id": 42,
             "instruction_prompt": "",
+            "include_event_context": True,
             "enabled": True,
             "created_at": "2026-06-15T00:00:00",
             "updated_at": "2026-06-15T00:00:00",
@@ -561,13 +1256,18 @@ class TestMCPScheduleTools:
             assert len(result) == 1
             assert result[0]["cron_schedule"] == "0 * * * *"
 
-            respx.post("http://fake/api/v1/workspaces/1/sessions/10/schedules").mock(
+            create_route = respx.post("http://fake/api/v1/workspaces/1/sessions/10/schedules")
+            create_route.mock(
                 return_value=httpx.Response(201, json=sched_data)
             )
             created = await server._add_session_schedule(
-                1, 10, "0 * * * *", label="hourly"
+                1, 10, "0 * * * *", label="hourly", prompt_id=42, include_event_context=False
             )
             assert created["label"] == "hourly"
+
+            create_request = create_route.calls[0].request
+            assert create_request.content is not None
+            assert '"include_event_context":false' in create_request.content.decode()
 
             updated_data = {**sched_data, "label": "every-hour", "enabled": False}
             respx.put("http://fake/api/v1/workspaces/1/sessions/10/schedules/1").mock(

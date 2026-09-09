@@ -24,6 +24,56 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+async def _run_source_snapshot(db: AsyncSession, session: Session) -> tuple[str, str, str, str]:
+    """Resolve the (schedule_label, prompt_name, trigger_type, event_context) snapshot for a session.
+
+    Prefers the active schedule's label/prompt (the run was triggered by a
+    schedule); falls back to the session's own configured prompt and event_context.
+    """
+    import json as _json
+    from swarmer.models.workspace_prompt import WorkspacePrompt
+
+    schedule_label = ""
+    prompt_name = ""
+    trigger_type = "manual"
+    event_context = ""
+    raw_event_context = session.event_context or ""
+
+    active_schedule = session.active_schedule
+    if active_schedule:
+        trigger_type = active_schedule.trigger_type or "cron"
+        schedule_label = active_schedule.label or active_schedule.trigger_label
+        if active_schedule.prompt:
+            prompt_name = active_schedule.prompt.display_name
+    elif raw_event_context:
+        trigger_type = "event"
+
+    # Only retain event_context when this run was actually event-triggered —
+    # session.event_context is set once by the PR watcher and otherwise never
+    # cleared, so a later cron/manual/queued run on the same session must not
+    # inherit a prior run's stale PR metadata (ACM-42674 follow-up).
+    if trigger_type == "event" and raw_event_context:
+        event_context = raw_event_context
+        try:
+            ctx = _json.loads(event_context)
+            pr_num = ctx.get("pr_number")
+            event_condition = ctx.get("event_condition")
+            if pr_num and event_condition:
+                schedule_label = f"PR #{pr_num} ({event_condition})"
+            elif pr_num:
+                schedule_label = f"PR #{pr_num}"
+            elif event_condition:
+                schedule_label = f"{event_condition}"
+        except Exception:
+            schedule_label = "GitHub Event"
+
+    if not prompt_name and session.prompt_id:
+        prompt = await db.get(WorkspacePrompt, session.prompt_id)
+        if prompt:
+            prompt_name = prompt.display_name
+    return schedule_label, prompt_name, trigger_type, event_context
+
+
 async def record_session_run(
     db: AsyncSession,
     session: Session,
@@ -44,6 +94,8 @@ async def record_session_run(
         )
         return None
 
+    schedule_label, prompt_name, trigger_type, event_context = await _run_source_snapshot(db, session)
+
     run = SessionRun(
         session_id=session.id,
         phase=phase,
@@ -52,8 +104,20 @@ async def record_session_run(
         completed_at=_as_utc(completed_at),
         last_output=last_output or "",
         raw_output=raw_output or "",
+        schedule_label=schedule_label,
+        prompt_name=prompt_name,
+        mode=session.mode or "prompt",
+        trigger_type=trigger_type,
+        event_context=event_context,
     )
     db.add(run)
+    # Reconcile in-flight PR watcher dispatches for this session
+    try:
+        from swarmer.pr_watcher_store import reconcile_completed
+        await reconcile_completed(db, session.id, phase)
+    except Exception:
+        log.warning("record_session_run: failed to reconcile pr_action_state for session %d", session.id, exc_info=True)
+
     await _prune_old_runs(
         db,
         session.id,

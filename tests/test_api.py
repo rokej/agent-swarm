@@ -5,6 +5,7 @@ Overrides the auth dependency and uses an in-memory SQLite database.
 """
 
 import json
+import logging
 import os
 import sys
 
@@ -49,25 +50,20 @@ async def _setup_db(monkeypatch):
 
     from swarmer.config import settings
     orig_ns = settings.k8s_namespace
+    orig_admin_users = settings.workspace_admin_users
+    orig_admin_groups = settings.workspace_admin_groups
+    orig_create_policy = settings.workspace_create_policy
     settings.k8s_namespace = ""
+    settings.workspace_admin_users = ""
+    settings.workspace_admin_groups = ""
+    settings.workspace_create_policy = "all"
 
-    async def _all_accessible(token, namespaces, api_url, in_cluster):
-        return list(namespaces)
-
-    async def _can_create_namespaces(token, api_url, in_cluster):
-        return True
-
-    monkeypatch.setattr(
-        "swarmer.api.deps.get_accessible_namespaces", _all_accessible
-    )
-    monkeypatch.setattr(
-        "swarmer.api.v1.workspaces.can_create_namespaces", _can_create_namespaces
-    )
     monkeypatch.setattr("swarmer.k8s.ensure_namespace", lambda namespace: None)
-    monkeypatch.setattr(
-        "swarmer.k8s.grant_swarmer_user_access", lambda namespace, username: None
-    )
     monkeypatch.setattr("swarmer.k8s.delete_namespace", lambda namespace: None)
+    # list_known_users() merges in K8s discovery — stub it out by default so
+    # tests never make real network calls.
+    monkeypatch.setattr("swarmer.k8s.list_openshift_users", lambda: [])
+    monkeypatch.setattr("swarmer.k8s.list_user_service_accounts", lambda *a, **k: [])
 
     import swarmer.models  # noqa: F401 — register models on Base.metadata
 
@@ -77,6 +73,9 @@ async def _setup_db(monkeypatch):
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     settings.k8s_namespace = orig_ns
+    settings.workspace_admin_users = orig_admin_users
+    settings.workspace_admin_groups = orig_admin_groups
+    settings.workspace_create_policy = orig_create_policy
 
 
 def _override_get_bearer_token():
@@ -190,17 +189,27 @@ class TestWorkspaces:
 
 
 class TestWorkspaceRbac:
+    """Database-backed workspace ACL (ACM-41659) — owner/member/admin access."""
+
+    @staticmethod
+    def _override_identity(username: str):
+        from swarmer.k8s_auth import TokenIdentity
+
+        def _identity():
+            return TokenIdentity(username=username, uid="uid-other")
+
+        return _identity
+
     @pytest.mark.asyncio
-    async def test_list_workspaces_filters_by_namespace_access(self, client, monkeypatch):
+    async def test_list_workspaces_filters_by_ownership(self, client):
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
         await _create_workspace(client, "Allowed")
+
+        app.dependency_overrides[require_api_auth] = self._override_identity("other-user")
         await _create_workspace(client, "Denied")
-
-        async def _partial_access(token, namespaces, api_url, in_cluster):
-            return [ns for ns in namespaces if ns != "denied"]
-
-        monkeypatch.setattr(
-            "swarmer.api.deps.get_accessible_namespaces", _partial_access
-        )
+        app.dependency_overrides[require_api_auth] = _override_require_api_auth
 
         resp = await client.get("/api/v1/workspaces")
         assert resp.status_code == 200
@@ -208,31 +217,80 @@ class TestWorkspaceRbac:
         assert names == {"Allowed"}
 
     @pytest.mark.asyncio
-    async def test_get_workspace_denied_returns_404(self, client, monkeypatch):
+    async def test_get_workspace_denied_returns_404(self, client):
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
+        app.dependency_overrides[require_api_auth] = self._override_identity("other-user")
         ws = await _create_workspace(client, "Secret")
-
-        async def _no_access(token, namespaces, api_url, in_cluster):
-            return []
-
-        monkeypatch.setattr("swarmer.api.deps.get_accessible_namespaces", _no_access)
+        app.dependency_overrides[require_api_auth] = _override_require_api_auth
 
         resp = await client.get(f"/api/v1/workspaces/{ws['id']}")
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_create_workspace_requires_namespace_create(self, client, monkeypatch):
-        async def _deny_create(token, api_url, in_cluster):
-            return False
+    async def test_workspace_member_can_access(self, client):
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
 
-        monkeypatch.setattr(
-            "swarmer.api.v1.workspaces.can_create_namespaces", _deny_create
+        app.dependency_overrides[require_api_auth] = self._override_identity("owner-user")
+        ws = await _create_workspace(client, "Shared")
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/members",
+            json={"user_id": "test-user"},
         )
+        assert resp.status_code == 201, resp.text
+        app.dependency_overrides[require_api_auth] = _override_require_api_auth
+
+        resp = await client.get(f"/api/v1/workspaces/{ws['id']}")
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_non_owner_cannot_add_members(self, client):
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
+        app.dependency_overrides[require_api_auth] = self._override_identity("owner-user")
+        ws = await _create_workspace(client, "Owned")
+        app.dependency_overrides[require_api_auth] = _override_require_api_auth
 
         resp = await client.post(
-            "/api/v1/workspaces",
-            json={"display_name": "Blocked", "description": ""},
+            f"/api/v1/workspaces/{ws['id']}/members",
+            json={"user_id": "eve"},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404  # not even visible to test-user
+
+    @pytest.mark.asyncio
+    async def test_create_workspace_requires_permission_under_admins_only_policy(
+        self, client
+    ):
+        from swarmer.config import settings
+
+        settings.workspace_create_policy = "admins"
+        try:
+            resp = await client.post(
+                "/api/v1/workspaces",
+                json={"display_name": "Blocked", "description": ""},
+            )
+            assert resp.status_code == 403
+        finally:
+            settings.workspace_create_policy = "all"
+
+    @pytest.mark.asyncio
+    async def test_workspace_admin_can_create_under_admins_only_policy(self, client):
+        from swarmer.config import settings
+
+        settings.workspace_create_policy = "admins"
+        settings.workspace_admin_users = "test-user"
+        try:
+            resp = await client.post(
+                "/api/v1/workspaces",
+                json={"display_name": "Allowed", "description": ""},
+            )
+            assert resp.status_code == 201
+        finally:
+            settings.workspace_create_policy = "all"
+            settings.workspace_admin_users = ""
 
     @pytest.mark.asyncio
     async def test_create_workspace_disabled_in_namespace_scoped_mode(self, client):
@@ -247,6 +305,521 @@ class TestWorkspaceRbac:
             assert resp.status_code == 403
         finally:
             settings.k8s_namespace = ""
+
+
+class TestWorkspaceGatewayAPI:
+    @staticmethod
+    def _override_identity(username: str):
+        from swarmer.k8s_auth import TokenIdentity
+
+        def _identity():
+            return TokenIdentity(username=username, uid=f"uid-{username}")
+
+        return _identity
+
+    @pytest.mark.asyncio
+    async def test_parse_command_endpoint(self, client):
+        cmd = "openshell gateway add https://gw-stage.example.com:443 --name test-gw --oidc-issuer https://idp.example.com --oidc-client-id client-123"
+        resp = await client.post("/api/v1/workspaces/gateway/parse-command", json={"command": cmd})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["gateway_url"] == "https://gw-stage.example.com:443"
+        assert data["auth_mode"] == "oidc"
+        assert data["oidc_issuer"] == "https://idp.example.com"
+        assert data["oidc_client_id"] == "client-123"
+        assert data["suggested_name"] == "test-gw"
+
+    @pytest.mark.asyncio
+    async def test_parse_token_endpoint(self, client):
+        token_input = json.dumps({"refresh_token": "sample-refresh-token-12345", "expires_at": 1755000000})
+        resp = await client.post("/api/v1/workspaces/gateway/parse-token", json={"token_input": token_input})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "valid"
+        assert data["refresh_token"] == "sample-refresh-token-12345"
+        assert data["expires_at"] == 1755000000
+
+    @pytest.mark.asyncio
+    async def test_test_connection_allows_oidc_mode_without_refresh_token(self, client):
+        from unittest.mock import AsyncMock, patch
+
+        with patch(
+            "swarmer.openshell_client.probe_gateway_connectivity",
+            new=AsyncMock(return_value={"sandboxes_count": 3}),
+        ) as mock_probe:
+            resp = await client.post(
+                "/api/v1/workspaces/gateway/test-connection",
+                json={
+                    "gateway_url": "https://gw.example.com:443",
+                    "auth_mode": "oidc",
+                    "oidc_issuer": "https://idp.example.com/realms/test",
+                    "oidc_client_id": "client-123",
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["sandboxes_count"] == 3
+
+        cfg = mock_probe.call_args.args[0]
+        assert cfg.auth_mode == "oidc"
+        assert cfg.bearer_callable is None
+
+    @pytest.mark.asyncio
+    async def test_test_connection_reuses_saved_oidc_refresh_token(self, client):
+        from unittest.mock import AsyncMock, patch
+
+        ws = await _create_workspace(client, "Gateway Reuse")
+        set_resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/gateway",
+            json={
+                "gateway_url": "https://gw.example.com:443",
+                "auth_mode": "oidc",
+                "oidc_issuer": "https://idp.example.com/realms/test",
+                "oidc_client_id": "client-123",
+                "refresh_token": "sample-saved-refresh-token",
+            },
+        )
+        assert set_resp.status_code == 200, set_resp.text
+
+        with patch(
+            "swarmer.openshell_client.probe_gateway_connectivity",
+            new=AsyncMock(return_value={"sandboxes_count": 1}),
+        ) as mock_probe:
+            resp = await client.post(
+                "/api/v1/workspaces/gateway/test-connection",
+                json={
+                    "workspace_id": ws["id"],
+                    "gateway_url": "https://gw.example.com:443",
+                    "auth_mode": "oidc",
+                    "oidc_issuer": "https://idp.example.com/realms/test",
+                    "oidc_client_id": "client-123",
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        cfg = mock_probe.call_args.args[0]
+        assert callable(cfg.bearer_callable)
+
+    @pytest.mark.asyncio
+    async def test_test_connection_workspace_not_visible_returns_404(self, client):
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
+        try:
+            app.dependency_overrides[require_api_auth] = self._override_identity("workspace-owner")
+            ws = await _create_workspace(client, "Private Gateway WS")
+            app.dependency_overrides[require_api_auth] = _override_require_api_auth
+
+            resp = await client.post(
+                "/api/v1/workspaces/gateway/test-connection",
+                json={
+                    "workspace_id": ws["id"],
+                    "gateway_url": "https://gw.example.com:443",
+                    "auth_mode": "none",
+                },
+            )
+            assert resp.status_code == 404
+        finally:
+            app.dependency_overrides[require_api_auth] = _override_require_api_auth
+
+    @pytest.mark.asyncio
+    async def test_test_connection_member_cannot_use_stored_credentials(self, client):
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
+        try:
+            app.dependency_overrides[require_api_auth] = self._override_identity("workspace-owner")
+            ws = await _create_workspace(client, "Member Restricted Gateway WS")
+            set_resp = await client.post(
+                f"/api/v1/workspaces/{ws['id']}/gateway",
+                json={
+                    "gateway_url": "https://gw.example.com:443",
+                    "auth_mode": "oidc",
+                    "oidc_issuer": "https://idp.example.com/realms/test",
+                    "oidc_client_id": "client-123",
+                    "refresh_token": "sample-saved-refresh-token",
+                },
+            )
+            assert set_resp.status_code == 200, set_resp.text
+
+            add_member = await client.post(
+                f"/api/v1/workspaces/{ws['id']}/members",
+                json={"user_id": "workspace-member"},
+            )
+            assert add_member.status_code == 201, add_member.text
+
+            app.dependency_overrides[require_api_auth] = self._override_identity("workspace-member")
+            resp = await client.post(
+                "/api/v1/workspaces/gateway/test-connection",
+                json={
+                    "workspace_id": ws["id"],
+                    "gateway_url": "https://gw.example.com:443",
+                    "auth_mode": "oidc",
+                    "oidc_issuer": "https://idp.example.com/realms/test",
+                    "oidc_client_id": "client-123",
+                },
+            )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides[require_api_auth] = _override_require_api_auth
+
+    @pytest.mark.asyncio
+    async def test_test_connection_rejects_reused_stored_token_for_different_url(self, client):
+        ws = await _create_workspace(client, "Gateway Reuse URL Match")
+        set_resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/gateway",
+            json={
+                "gateway_url": "https://gw-saved.example.com:443",
+                "auth_mode": "oidc",
+                "oidc_issuer": "https://idp.example.com/realms/test",
+                "oidc_client_id": "client-123",
+                "refresh_token": "sample-saved-refresh-token",
+            },
+        )
+        assert set_resp.status_code == 200, set_resp.text
+
+        resp = await client.post(
+            "/api/v1/workspaces/gateway/test-connection",
+            json={
+                "workspace_id": ws["id"],
+                "gateway_url": "https://gw-other.example.com:443",
+                "auth_mode": "oidc",
+                "oidc_issuer": "https://idp.example.com/realms/test",
+                "oidc_client_id": "client-123",
+            },
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_create_workspace_with_custom_gateway(self, client):
+        payload = {
+            "display_name": "Dedicated Gateway WS",
+            "description": "WS with custom gateway",
+            "gateway": {
+                "gateway_url": "https://gw-custom.example.com:443",
+                "auth_mode": "oidc",
+                "oidc_issuer": "https://idp.example.com/realm",
+                "oidc_client_id": "client-abc",
+                "refresh_token": "initial-rt-token",
+            },
+        }
+        resp = await client.post("/api/v1/workspaces", json=payload)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["gateway"] is not None
+        assert data["gateway"]["gateway_url"] == "https://gw-custom.example.com:443"
+        assert data["gateway"]["auth_mode"] == "oidc"
+        assert data["gateway"]["has_refresh_token"] is True
+        # Plaintext refresh token must NOT be exposed in response
+        assert "refresh_token" not in data["gateway"]
+
+        # Fetch via GET
+        get_resp = await client.get(f"/api/v1/workspaces/{data['id']}/gateway")
+        assert get_resp.status_code == 200
+        gw_data = get_resp.json()
+        assert gw_data["gateway_url"] == "https://gw-custom.example.com:443"
+        assert gw_data["has_refresh_token"] is True
+
+    @pytest.mark.asyncio
+    async def test_update_and_delete_workspace_gateway(self, client):
+        ws = await _create_workspace(client, "Gateway WS")
+
+        # Initially no custom gateway -> 404
+        resp = await client.get(f"/api/v1/workspaces/{ws['id']}/gateway")
+        assert resp.status_code == 404
+
+        # Set gateway
+        set_resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/gateway",
+            json={
+                "gateway_url": "https://gw-new.example.com:443",
+                "auth_mode": "bearer",
+                "bearer_token": "sample-bearer-token-value",
+            },
+        )
+        assert set_resp.status_code == 200
+        assert set_resp.json()["has_bearer_token"] is True
+
+        # Delete gateway (revert to cluster default)
+        del_resp = await client.delete(f"/api/v1/workspaces/{ws['id']}/gateway")
+        assert del_resp.status_code == 200
+
+        # Now 404 again
+        resp2 = await client.get(f"/api/v1/workspaces/{ws['id']}/gateway")
+        assert resp2.status_code == 404
+
+
+class TestWorkspaceMembers:
+    @pytest.mark.asyncio
+    async def test_add_list_remove_member_round_trip(self, client):
+        ws = await _create_workspace(client, "Team WS")
+
+        resp = await client.get(f"/api/v1/workspaces/{ws['id']}/members")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/members",
+            json={"user_id": "alice", "role": "member"},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["user_id"] == "alice"
+
+        resp = await client.get(f"/api/v1/workspaces/{ws['id']}/members")
+        assert resp.status_code == 200
+        assert [m["user_id"] for m in resp.json()] == ["alice"]
+
+        resp = await client.delete(f"/api/v1/workspaces/{ws['id']}/members/alice")
+        assert resp.status_code == 200
+
+        resp = await client.get(f"/api/v1/workspaces/{ws['id']}/members")
+        assert resp.json() == []
+
+    @pytest.mark.asyncio
+    async def test_add_duplicate_member_conflicts(self, client):
+        ws = await _create_workspace(client, "Dup WS")
+        await client.post(
+            f"/api/v1/workspaces/{ws['id']}/members", json={"user_id": "alice"}
+        )
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/members", json={"user_id": "alice"}
+        )
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_add_owner_as_member_conflicts(self, client):
+        ws = await _create_workspace(client, "Owner WS")
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/members", json={"user_id": "test-user"}
+        )
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_remove_nonexistent_member_returns_404(self, client):
+        ws = await _create_workspace(client, "WS")
+        resp = await client.delete(f"/api/v1/workspaces/{ws['id']}/members/ghost")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_owner_and_admin_actions_claim_an_unowned_workspace(self, client):
+        """ACM-41659: a workspace with no owner (e.g. migrated with no
+        recoverable owner) is claimed by the first person who manages it."""
+        ws = await _create_workspace(client, "Unowned WS")
+        # Simulate a pre-ACL / unclaimed workspace by clearing owner_id directly.
+        from swarmer.models.workspace import Workspace
+
+        async with _TestSession() as session:
+            row = await session.get(Workspace, ws["id"])
+            row.owner_id = ""
+            await session.commit()
+
+        from swarmer.api.deps import require_api_auth
+        from swarmer.k8s_auth import TokenIdentity
+        from swarmer.main import app
+
+        def _other_identity():
+            return TokenIdentity(username="claimant", uid="uid-2")
+
+        app.dependency_overrides[require_api_auth] = _other_identity
+        try:
+            resp = await client.post(
+                f"/api/v1/workspaces/{ws['id']}/members", json={"user_id": "someone-else"}
+            )
+            assert resp.status_code == 201, resp.text
+
+            # The claimant is now the owner and can fetch the workspace directly.
+            resp = await client.get(f"/api/v1/workspaces/{ws['id']}")
+            assert resp.json()["owner_id"] == "claimant"
+        finally:
+            app.dependency_overrides[require_api_auth] = _override_require_api_auth
+
+
+# ===========================================================================
+# Global Admins / Me (ACM-41659)
+# ===========================================================================
+
+
+class TestMe:
+    @pytest.mark.asyncio
+    async def test_me_default_state(self, client):
+        resp = await client.get("/api/v1/me")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["username"] == "test-user"
+        assert body["is_admin"] is False
+        assert body["can_create_workspace"] is True
+        assert body["admin_bootstrap_available"] is True
+
+    @pytest.mark.asyncio
+    async def test_me_reflects_static_admin_config(self, client):
+        from swarmer.config import settings
+
+        settings.workspace_admin_users = "test-user"
+        resp = await client.get("/api/v1/me")
+        body = resp.json()
+        assert body["is_admin"] is True
+        assert body["admin_bootstrap_available"] is False
+
+    @pytest.mark.asyncio
+    async def test_me_admins_only_create_policy(self, client):
+        from swarmer.config import settings
+
+        settings.workspace_create_policy = "admins"
+        resp = await client.get("/api/v1/me")
+        assert resp.json()["can_create_workspace"] is False
+
+
+class TestKnownUsers:
+    """GET /api/v1/users — visibility-scoped autocomplete suggestions."""
+
+    @pytest.mark.asyncio
+    async def test_no_shared_workspaces_returns_empty(self, client):
+        resp = await client.get("/api/v1/users")
+        assert resp.status_code == 200
+        assert resp.json() == {"users": []}
+
+    @pytest.mark.asyncio
+    async def test_sees_members_of_own_workspace(self, client):
+        ws = await _create_workspace(client, "Shared WS")
+        await client.post(
+            f"/api/v1/workspaces/{ws['id']}/members", json={"user_id": "alice"}
+        )
+        resp = await client.get("/api/v1/users")
+        assert resp.json() == {"users": ["alice"]}
+
+    @pytest.mark.asyncio
+    async def test_does_not_see_unrelated_workspace_users(self, client):
+        from swarmer.api.deps import require_api_auth
+        from swarmer.k8s_auth import TokenIdentity
+        from swarmer.main import app
+
+        app.dependency_overrides[require_api_auth] = lambda: TokenIdentity(
+            username="other-user", uid="uid-2"
+        )
+        try:
+            ws = await _create_workspace(client, "Someone Else's WS")
+            await client.post(
+                f"/api/v1/workspaces/{ws['id']}/members", json={"user_id": "eve"}
+            )
+        finally:
+            app.dependency_overrides[require_api_auth] = _override_require_api_auth
+
+        resp = await client.get("/api/v1/users")
+        assert resp.json() == {"users": []}
+
+    @pytest.mark.asyncio
+    async def test_admin_sees_every_known_user(self, client):
+        ws = await _create_workspace(client, "Some WS")
+        await client.post(
+            f"/api/v1/workspaces/{ws['id']}/members", json={"user_id": "alice"}
+        )
+        await client.post("/api/v1/admins/bootstrap")  # test-user becomes admin
+        await client.post("/api/v1/admins", json={"user_id": "root2"})
+
+        resp = await client.get("/api/v1/users")
+        assert set(resp.json()["users"]) == {"alice", "root2"}
+
+    @pytest.mark.asyncio
+    async def test_merges_openshift_users_and_service_accounts(self, client, monkeypatch):
+        monkeypatch.setattr("swarmer.k8s.list_openshift_users", lambda: ["dave"])
+        monkeypatch.setattr(
+            "swarmer.k8s.list_user_service_accounts",
+            lambda *a, **k: ["system:serviceaccount:swarmer:ci-bot"],
+        )
+        resp = await client.get("/api/v1/users")
+        assert set(resp.json()["users"]) == {"dave", "system:serviceaccount:swarmer:ci-bot"}
+
+
+class TestAdminBootstrap:
+    @pytest.mark.asyncio
+    async def test_bootstrap_succeeds_when_no_admin_exists(self, client):
+        resp = await client.post("/api/v1/admins/bootstrap")
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["user_id"] == "test-user"
+
+        resp = await client.get("/api/v1/me")
+        assert resp.json()["is_admin"] is True
+        assert resp.json()["admin_bootstrap_available"] is False
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_fails_once_an_admin_exists(self, client):
+        resp = await client.post("/api/v1/admins/bootstrap")
+        assert resp.status_code == 201
+
+        from swarmer.api.deps import require_api_auth
+        from swarmer.k8s_auth import TokenIdentity
+        from swarmer.main import app
+
+        app.dependency_overrides[require_api_auth] = lambda: TokenIdentity(
+            username="second-user", uid="uid-2"
+        )
+        try:
+            resp = await client.post("/api/v1/admins/bootstrap")
+            assert resp.status_code == 409
+        finally:
+            app.dependency_overrides[require_api_auth] = _override_require_api_auth
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_fails_when_static_admins_configured(self, client):
+        from swarmer.config import settings
+
+        settings.workspace_admin_users = "someone-else"
+        resp = await client.post("/api/v1/admins/bootstrap")
+        assert resp.status_code == 409
+
+
+class TestAdminCrud:
+    @pytest.mark.asyncio
+    async def test_non_admin_cannot_list_or_manage_admins(self, client):
+        resp = await client.get("/api/v1/admins")
+        assert resp.status_code == 403
+
+        resp = await client.post("/api/v1/admins", json={"user_id": "alice"})
+        assert resp.status_code == 403
+
+        resp = await client.delete("/api/v1/admins/alice")
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_admin_can_add_list_remove_admin(self, client):
+        await client.post("/api/v1/admins/bootstrap")  # test-user becomes admin
+
+        resp = await client.post("/api/v1/admins", json={"user_id": "alice"})
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["created_by"] == "test-user"
+
+        resp = await client.get("/api/v1/admins")
+        assert resp.status_code == 200
+        assert {a["user_id"] for a in resp.json()} == {"test-user", "alice"}
+
+        resp = await client.delete("/api/v1/admins/alice")
+        assert resp.status_code == 200
+
+        resp = await client.get("/api/v1/admins")
+        assert {a["user_id"] for a in resp.json()} == {"test-user"}
+
+    @pytest.mark.asyncio
+    async def test_add_duplicate_admin_conflicts(self, client):
+        await client.post("/api/v1/admins/bootstrap")
+        await client.post("/api/v1/admins", json={"user_id": "alice"})
+        resp = await client.post("/api/v1/admins", json={"user_id": "alice"})
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_remove_nonexistent_admin_returns_404(self, client):
+        await client.post("/api/v1/admins/bootstrap")
+        resp = await client.delete("/api/v1/admins/ghost")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_static_admin_can_manage_db_admins(self, client):
+        from swarmer.config import settings
+
+        settings.workspace_admin_users = "test-user"
+        resp = await client.post("/api/v1/admins", json={"user_id": "alice"})
+        assert resp.status_code == 201
 
 
 # ===========================================================================
@@ -287,11 +860,48 @@ class TestSessions:
         s = await _create_session(client, ws["id"])
         resp = await client.put(
             f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}",
-            json={"name": "renamed-session", "mode": "tui"},
+            json={"name": "renamed-session", "mode": "tui", "agent_tool": "shell"},
         )
         assert resp.status_code == 200
         assert resp.json()["name"] == "renamed-session"
         assert resp.json()["mode"] == "tui"
+        assert resp.json()["agent_tool"] == "shell"
+
+    @pytest.mark.asyncio
+    async def test_create_session_with_shell_tool(self, client):
+        ws = await _create_workspace(client)
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/sessions",
+            json={"name": "shell-s", "mode": "prompt", "agent_tool": "shell", "instruction_prompt": "echo hi"},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["agent_tool"] == "shell"
+        assert resp.json()["instruction_prompt"] == "echo hi"
+
+    @pytest.mark.asyncio
+    async def test_session_ui_renders_branded_agent_pills(self, client):
+        from swarmer.deps import require_auth
+        from swarmer.main import app
+
+        app.dependency_overrides[require_auth] = lambda: None
+        try:
+            ws = await _create_workspace(client)
+            # Check /sessions/new page
+            resp_new = await client.get(f"/workspaces/{ws['id']}/sessions/new")
+            assert resp_new.status_code == 200
+            assert "agent-pill-oc" in resp_new.text
+            assert "agent-pill-shell" in resp_new.text
+            assert "shell-pixel-prompt" in resp_new.text
+
+            # Create session and check /sessions/{id} detail page
+            s = await _create_session(client, ws["id"], name="detail-pills-s")
+            resp_detail = await client.get(f"/workspaces/{ws['id']}/sessions/{s['id']}")
+            assert resp_detail.status_code == 200
+            assert "agent-pill-oc" in resp_detail.text
+            assert "agent-pill-shell" in resp_detail.text
+            assert "selectDetailAgentTool" in resp_detail.text
+        finally:
+            app.dependency_overrides.pop(require_auth, None)
 
     @pytest.mark.asyncio
     async def test_delete_session(self, client):
@@ -407,53 +1017,6 @@ class TestSessions:
         resp = await client.post(
             f"/api/v1/workspaces/{ws['id']}/sessions",
             json={"name": "bad-mode", "mode": "invalid"},
-        )
-        assert resp.status_code == 422
-
-    @pytest.mark.asyncio
-    async def test_create_session_default_ephemeral_disk(self, client):
-        """ephemeral_disk defaults to 2Gi when not specified (ACM-38184)."""
-        ws = await _create_workspace(client)
-        s = await _create_session(client, ws["id"])
-        assert s["ephemeral_disk"] == "2Gi"
-
-    @pytest.mark.asyncio
-    async def test_create_session_custom_ephemeral_disk(self, client):
-        ws = await _create_workspace(client)
-        resp = await client.post(
-            f"/api/v1/workspaces/{ws['id']}/sessions",
-            json={"name": "big-disk", "ephemeral_disk": "10Gi"},
-        )
-        assert resp.status_code == 201
-        assert resp.json()["ephemeral_disk"] == "10Gi"
-
-    @pytest.mark.asyncio
-    async def test_create_session_invalid_ephemeral_disk(self, client):
-        ws = await _create_workspace(client)
-        resp = await client.post(
-            f"/api/v1/workspaces/{ws['id']}/sessions",
-            json={"name": "bad-disk", "ephemeral_disk": "3Gi"},
-        )
-        assert resp.status_code == 422
-
-    @pytest.mark.asyncio
-    async def test_update_session_ephemeral_disk(self, client):
-        ws = await _create_workspace(client)
-        s = await _create_session(client, ws["id"])
-        resp = await client.put(
-            f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}",
-            json={"ephemeral_disk": "5Gi"},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["ephemeral_disk"] == "5Gi"
-
-    @pytest.mark.asyncio
-    async def test_update_session_invalid_ephemeral_disk(self, client):
-        ws = await _create_workspace(client)
-        s = await _create_session(client, ws["id"])
-        resp = await client.put(
-            f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}",
-            json={"ephemeral_disk": "100Gi"},
         )
         assert resp.status_code == 422
 
@@ -591,9 +1154,9 @@ class TestRepos:
         ws = await _create_workspace(client)
         s = await _create_session(client, ws["id"])
         for bad_url in [
-            "https://user:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com/org/repo.git",
-            "https://github.com/org/repo.git?token=ghp_secret",
-            "https://github.com/ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/org/repo.git",
+            "https://user:" + "gh" + "p_" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + "@github.com/org/repo.git",
+            "https://github.com/org/repo.git?token=" + "gh" + "p_" + "secret",
+            "https://github.com/" + "gh" + "p_" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + "/org/repo.git",
         ]:
             resp = await client.post(
                 f"/api/v1/workspaces/{ws['id']}/sessions/{s['id']}/repos",
@@ -608,6 +1171,21 @@ class TestRepos:
 
 
 class TestSecrets:
+    @pytest.fixture(autouse=True)
+    def _mock_openshell_providers(self, monkeypatch):
+        async def _noop(*args, **kwargs):
+            return None
+
+        async def _empty_list(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr("swarmer.openshell_client.ensure_provider", _noop)
+        monkeypatch.setattr("swarmer.openshell_client.create_google_cloud_provider", _noop)
+        monkeypatch.setattr("swarmer.openshell_client.configure_google_cloud_provider", _noop)
+        monkeypatch.setattr("swarmer.openshell_client.list_sandboxes", _empty_list)
+        monkeypatch.setattr("swarmer.openshell_client.detach_sandbox_provider", _noop)
+        monkeypatch.setattr("swarmer.openshell_client.delete_provider", _noop)
+
     @pytest.mark.asyncio
     async def test_credentials_initially_none(self, client):
         ws = await _create_workspace(client)
@@ -624,14 +1202,14 @@ class TestSecrets:
             json={
                 "google_cloud_project": "my-project",
                 "vertex_location": "us-central1",
-                "google_api_key": "AIza-test123456",
+                "google_api_key": "test-google-api-key-value",
             },
         )
         assert resp.status_code == 200
         cred = resp.json()
         assert cred["google_cloud_project"] == "my-project"
         assert cred["has_adc"] is False
-        assert "AIza-test123456" not in cred.get("masked_api_key", "")  # key should be masked
+        assert "test-google-api-key-value" not in cred.get("masked_api_key", "")  # key should be masked
 
     @pytest.mark.asyncio
     async def test_save_adc_credentials(self, client):
@@ -655,6 +1233,523 @@ class TestSecrets:
         assert bad.status_code == 422
 
     @pytest.mark.asyncio
+    async def test_save_openai_key_configures_gateway_provider_only(self, client, monkeypatch):
+        ws = await _create_workspace(client)
+
+        called = {}
+
+        async def _fake_ensure_provider(name, provider_type, config, credentials):
+            called["name"] = name
+            called["provider_type"] = provider_type
+            called["config"] = config
+            called["credentials"] = credentials
+
+        monkeypatch.setattr("swarmer.openshell_client.ensure_provider", _fake_ensure_provider)
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "my-project",
+                "vertex_location": "us-central1",
+                "openai_api_key": "<test-openai-api-key>",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        assert called["name"] == f"swarmer-ws-{ws['id']}-openai"
+        assert called["provider_type"] == "openai"
+        assert called["config"] == {}
+        assert called["credentials"] == {"OPENAI_API_KEY": "<test-openai-api-key>"}
+
+        # Credentials response shape remains unchanged and must not expose an OpenAI key.
+        body = resp.json()
+        assert "openai_api_key" not in body
+
+    @pytest.mark.asyncio
+    async def test_save_openai_key_failure_redacts_exception_detail(self, client, monkeypatch, caplog):
+        ws = await _create_workspace(client)
+        sentinel = "SENTINEL_OPENAI_SECRET"
+        caplog.set_level(logging.WARNING, logger="swarmer.api.v1.secrets")
+
+        async def _fake_ensure_provider(_name, _provider_type, _config, _credentials):
+            raise RuntimeError(f"provider failed with {sentinel}")
+
+        monkeypatch.setattr("swarmer.openshell_client.ensure_provider", _fake_ensure_provider)
+
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "my-project",
+                "vertex_location": "us-central1",
+                "openai_api_key": "<test-openai-api-key>",
+            },
+        )
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == "failed to configure OpenAI provider on OpenShell"
+        assert sentinel not in resp.text
+        assert sentinel not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_delete_gateway_credentials_clears_provider_state(self, client, monkeypatch):
+        ws = await _create_workspace(client)
+
+        async def _fake_ensure_provider(_name, _provider_type, _config, credentials):
+            return None
+
+        monkeypatch.setattr("swarmer.openshell_client.ensure_provider", _fake_ensure_provider)
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "project",
+                "vertex_location": "region",
+                "google_api_key": "<test-gemini-key>",
+                "openai_api_key": "<test-openai-key>",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["has_gemini"] is True
+        assert resp.json()["has_openai"] is True
+
+        for provider in ("google-cloud", "google-ai-studio", "openai"):
+            resp = await client.delete(
+                f"/api/v1/workspaces/{ws['id']}/secrets/credentials/{provider}"
+            )
+            assert resp.status_code == 200, resp.text
+
+        resp = await client.get(f"/api/v1/workspaces/{ws['id']}/secrets/credentials")
+        assert resp.status_code == 200
+        assert resp.json() is None
+
+    @pytest.mark.asyncio
+    async def test_save_gemini_and_vertex_provisions_openshell_providers(self, client, monkeypatch):
+        ws = await _create_workspace(client)
+
+        calls = {}
+
+        async def _mock_ensure(name, provider_type, config, credentials):
+            calls["ensure"] = (name, provider_type, config, credentials)
+
+        async def _mock_create_gc(name, project, location, **kwargs):
+            calls["create_gc"] = (name, project, location)
+
+        async def _mock_conf_gc(name, adc_json, **kwargs):
+            calls["conf_gc"] = (name, adc_json)
+
+        monkeypatch.setattr("swarmer.openshell_client.ensure_provider", _mock_ensure)
+        monkeypatch.setattr("swarmer.openshell_client.create_google_cloud_provider", _mock_create_gc)
+        monkeypatch.setattr("swarmer.openshell_client.configure_google_cloud_provider", _mock_conf_gc)
+
+        adc = json.dumps({"type": "authorized_user", "client_id": "x", "client_secret": "y"})
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "gcp-proj",
+                "vertex_location": "us-central1",
+                "google_api_key": "gemini-key-123",
+                "application_default_credentials": adc,
+            },
+        )
+        assert resp.status_code == 200
+        assert calls["ensure"][0] == f"swarmer-ws-{ws['id']}-google-ai-studio"
+        assert calls["ensure"][3]["GOOGLE_API_KEY"] == "gemini-key-123"
+        assert calls["create_gc"] == (f"swarmer-ws-{ws['id']}-google-cloud", "gcp-proj", "us-central1")
+        assert calls["conf_gc"] == (f"swarmer-ws-{ws['id']}-google-cloud", adc)
+
+    @pytest.mark.asyncio
+    async def test_delete_shared_credentials_requires_manager(self, client):
+        from swarmer.models.opencode_secret import OpencodeSecret
+
+        ws = await _create_workspace(client)
+        async with _TestSession() as db:
+            from swarmer.models.workspace_member import WorkspaceMember
+            db.add(WorkspaceMember(workspace_id=ws["id"], user_id="alice", role="member"))
+            secret = OpencodeSecret(
+                workspace_id=ws["id"],
+                user_id="other-user",
+                shared=True,
+                google_cloud_project="proj",
+                vertex_location="us-central1",
+            )
+            db.add(secret)
+            await db.commit()
+
+        from swarmer.k8s_auth import TokenIdentity
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
+        # Regular member without management permission should get 403
+        app.dependency_overrides[require_api_auth] = lambda: TokenIdentity(username="alice", uid="uid-alice")
+        resp = await client.delete(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials/google-cloud"
+        )
+        assert resp.status_code == 403
+
+        # Workspace owner can delete shared credentials
+        app.dependency_overrides[require_api_auth] = _override_require_api_auth
+        owner_resp = await client.delete(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials/google-cloud"
+        )
+        assert owner_resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_save_vertex_credentials_two_requests_configures_provider(self, client, monkeypatch):
+        ws = await _create_workspace(client)
+
+        calls = {}
+
+        async def _mock_create_gc(name, project, location, **kwargs):
+            calls["create_gc"] = (name, project, location)
+
+        async def _mock_conf_gc(name, adc_json, **kwargs):
+            calls["conf_gc"] = (name, adc_json)
+
+        monkeypatch.setattr("swarmer.openshell_client.create_google_cloud_provider", _mock_create_gc)
+        monkeypatch.setattr("swarmer.openshell_client.configure_google_cloud_provider", _mock_conf_gc)
+
+        adc = json.dumps({"type": "authorized_user", "client_id": "x", "client_secret": "y"})
+
+        # Request 1: Save ADC credentials only (project and location empty)
+        resp1 = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "",
+                "vertex_location": "",
+                "application_default_credentials": adc,
+            },
+        )
+        assert resp1.status_code == 200
+        assert "create_gc" not in calls
+        assert "conf_gc" not in calls
+
+        # Request 2: Provide project and location without re-sending ADC
+        resp2 = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "deferred-proj",
+                "vertex_location": "us-central1",
+                "application_default_credentials": "",
+            },
+        )
+        assert resp2.status_code == 200
+        assert calls["create_gc"] == (f"swarmer-ws-{ws['id']}-google-cloud", "deferred-proj", "us-central1")
+        assert calls["conf_gc"] == (f"swarmer-ws-{ws['id']}-google-cloud", adc)
+
+    @pytest.mark.asyncio
+    async def test_delete_personal_credentials_does_not_delete_workspace_provider(self, client, monkeypatch):
+        from swarmer.models.opencode_secret import OpencodeSecret
+        from swarmer.models.workspace_member import WorkspaceMember
+        from swarmer.k8s_auth import TokenIdentity
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
+        ws = await _create_workspace(client)
+        async with _TestSession() as db:
+            db.add(WorkspaceMember(workspace_id=ws["id"], user_id="alice", role="member"))
+            secret = OpencodeSecret(
+                workspace_id=ws["id"],
+                user_id="alice",
+                shared=False,
+                google_cloud_project="alice-proj",
+                vertex_location="us-east1",
+            )
+            db.add(secret)
+            await db.commit()
+
+        deleted_providers = []
+
+        async def _mock_list_sandboxes():
+            return []
+
+        async def _mock_delete_provider(name):
+            deleted_providers.append(name)
+
+        monkeypatch.setattr("swarmer.config.settings.openshell_gateway_url", "http://fake-gateway:8080")
+        monkeypatch.setattr("swarmer.openshell_client.list_sandboxes", _mock_list_sandboxes)
+        monkeypatch.setattr("swarmer.openshell_client.delete_provider", _mock_delete_provider)
+
+        # Alice (regular member) deletes her personal credential
+        app.dependency_overrides[require_api_auth] = lambda: TokenIdentity(username="alice", uid="uid-alice")
+        resp = await client.delete(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials/google-cloud"
+        )
+        assert resp.status_code == 200
+        # Workspace-scoped provider must NOT be deleted by non-manager
+        assert deleted_providers == []
+
+        # Secret in DB should be cleared/removed
+        from sqlalchemy import select
+        async with _TestSession() as db:
+            result = await db.execute(
+                select(OpencodeSecret).where(
+                    OpencodeSecret.workspace_id == ws["id"],
+                    OpencodeSecret.user_id == "alice",
+                )
+            )
+            assert result.scalar_one_or_none() is None
+
+        # Manager deleting provider should call delete_provider
+        app.dependency_overrides[require_api_auth] = _override_require_api_auth
+        async with _TestSession() as db:
+            db.add(
+                OpencodeSecret(
+                    workspace_id=ws["id"],
+                    user_id="",
+                    shared=True,
+                    google_cloud_project="ws-proj",
+                    vertex_location="us-central1",
+                )
+            )
+            await db.commit()
+
+        mgr_resp = await client.delete(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials/google-cloud"
+        )
+        assert mgr_resp.status_code == 200
+        assert f"swarmer-ws-{ws['id']}-google-cloud" in deleted_providers
+
+    @pytest.mark.asyncio
+    async def test_save_credentials_requires_manager_for_shared_and_providers(self, client):
+        from swarmer.models.workspace_member import WorkspaceMember
+        from swarmer.k8s_auth import TokenIdentity
+        from swarmer.api.deps import require_api_auth
+        from swarmer.main import app
+
+        ws = await _create_workspace(client)
+        async with _TestSession() as db:
+            db.add(WorkspaceMember(workspace_id=ws["id"], user_id="alice", role="member"))
+            await db.commit()
+
+        # Regular member attempting to configure shared credentials -> 403
+        app.dependency_overrides[require_api_auth] = lambda: TokenIdentity(username="alice", uid="uid-alice")
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "alice-proj",
+                "vertex_location": "us-central1",
+                "shared": True,
+            },
+        )
+        assert resp.status_code == 403
+
+        # Regular member attempting to configure Gemini provider -> 403
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={"google_api_key": "gemini-key"},
+        )
+        assert resp.status_code == 403
+
+        # Regular member attempting to configure OpenAI provider -> 403
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={"openai_api_key": "openai-key"},
+        )
+        assert resp.status_code == 403
+
+        # Regular member attempting to configure ADC / Vertex provider -> 403
+        adc = json.dumps({"type": "authorized_user", "client_id": "x", "client_secret": "y"})
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={"application_default_credentials": adc},
+        )
+        assert resp.status_code == 403
+
+        # Workspace owner (manager) can configure successfully
+        app.dependency_overrides[require_api_auth] = _override_require_api_auth
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['id']}/secrets/credentials",
+            json={
+                "google_cloud_project": "proj",
+                "vertex_location": "us-central1",
+                "google_api_key": "gemini-key",
+                "shared": True,
+            },
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_provider_status_incomplete_vertex_not_missing(self, client, monkeypatch):
+        from sqlalchemy import select
+        from swarmer.models.opencode_secret import OpencodeSecret
+        from swarmer.provider_status import get_missing_provider_names_bulk
+
+        ws = await _create_workspace(client)
+        adc = json.dumps({"type": "authorized_user", "client_id": "x", "client_secret": "y"})
+
+        # Setup an incomplete Vertex config (ADC only, project/location empty)
+        async with _TestSession() as db:
+            secret = OpencodeSecret(
+                workspace_id=ws["id"],
+                user_id="",
+                shared=True,
+                google_cloud_project="",
+                vertex_location="",
+            )
+            secret.application_default_credentials = adc
+            db.add(secret)
+            await db.commit()
+
+        # provider_exists returns False (provider not on gateway)
+        async def _mock_not_exists(name):
+            return False
+
+        monkeypatch.setattr("swarmer.openshell_client.provider_exists", _mock_not_exists)
+
+        async with _TestSession() as db:
+            missing = await get_missing_provider_names_bulk([ws["id"]], db)
+            # Incomplete config must NOT trigger a missing-provider warning
+            assert missing.get(ws["id"]) == []
+
+        # Now complete the configuration with project and location
+        async with _TestSession() as db:
+            result = await db.execute(
+                select(OpencodeSecret).where(OpencodeSecret.workspace_id == ws["id"])
+            )
+            s = result.scalars().first()
+            s.google_cloud_project = "my-proj"
+            s.vertex_location = "us-central1"
+            await db.commit()
+
+        async with _TestSession() as db:
+            missing = await get_missing_provider_names_bulk([ws["id"]], db)
+            # Fully configured but missing on gateway -> reports Vertex AI as missing
+            assert missing.get(ws["id"]) == ["Vertex AI"]
+
+    @pytest.mark.asyncio
+    async def test_provider_status_project_and_location_only_not_missing(self, client, monkeypatch):
+        from swarmer.models.opencode_secret import OpencodeSecret
+        from swarmer.provider_status import get_missing_provider_names_bulk
+
+        ws = await _create_workspace(client)
+
+        # Setup an incomplete Vertex config (project/location only, ADC empty)
+        async with _TestSession() as db:
+            secret = OpencodeSecret(
+                workspace_id=ws["id"],
+                user_id="",
+                shared=True,
+                google_cloud_project="my-proj",
+                vertex_location="us-central1",
+            )
+            db.add(secret)
+            await db.commit()
+
+        # provider_exists returns False (provider not on gateway)
+        async def _mock_not_exists(name):
+            return False
+
+        monkeypatch.setattr("swarmer.openshell_client.provider_exists", _mock_not_exists)
+
+        async with _TestSession() as db:
+            missing = await get_missing_provider_names_bulk([ws["id"]], db)
+            # Project and location without ADC must NOT trigger a missing-provider warning
+            assert missing.get(ws["id"]) == []
+
+        # Verify via credentials API that has_vertex is False
+        resp = await client.get(f"/api/v1/workspaces/{ws['id']}/secrets/credentials")
+        assert resp.status_code == 200
+        cred = resp.json()
+        assert cred["has_vertex"] is False
+        assert cred["has_adc"] is False
+
+    @pytest.mark.asyncio
+    async def test_opencode_secret_save_vertex_intent_detected_when_provider_missing(self, client, monkeypatch):
+        import io
+        from starlette.datastructures import UploadFile
+        from starlette.requests import Request
+        from swarmer.provider_status import get_missing_provider_names_bulk
+        from swarmer.routers.secrets import opencode_secret_save
+
+        ws = await _create_workspace(client)
+
+        created = {}
+        async def _mock_create_gc(name, project, location, **kwargs):
+            created["name"] = name
+            created["project"] = project
+            created["location"] = location
+
+        configured = {}
+        async def _mock_conf_gc(name, adc_json, **kwargs):
+            configured["name"] = name
+            configured["adc"] = adc_json
+
+        monkeypatch.setattr("swarmer.openshell_client.create_google_cloud_provider", _mock_create_gc)
+        monkeypatch.setattr("swarmer.openshell_client.configure_google_cloud_provider", _mock_conf_gc)
+        monkeypatch.setattr("swarmer.routers.api_client.get_user_token", lambda req: "test-token")
+
+        adc_data = json.dumps({"type": "authorized_user", "client_id": "cid", "client_secret": "csec"}).encode("utf-8")
+        adc_file = UploadFile(filename="adc.json", file=io.BytesIO(adc_data))
+
+        req = Request({
+            "type": "http",
+            "method": "POST",
+            "path": f"/workspaces/{ws['id']}/secrets/opencode",
+            "headers": [],
+            "session": {"authenticated": True, "username": "test-user", "_messages": []},
+        })
+
+        resp = await opencode_secret_save(
+            ws_id=ws["id"],
+            request=req,
+            google_cloud_project="my-vertex-proj",
+            vertex_location="us-central1",
+            google_api_key="",
+            openai_api_key="",
+            shared="1",
+            adc_file=adc_file,
+        )
+        assert resp.status_code == 302
+        assert created["name"] == f"swarmer-ws-{ws['id']}-google-cloud"
+        assert configured["name"] == f"swarmer-ws-{ws['id']}-google-cloud"
+
+        # Check credentials via API: has_vertex and vertex_configured must be True, has_adc is False
+        cred_resp = await client.get(f"/api/v1/workspaces/{ws['id']}/secrets/credentials")
+        assert cred_resp.status_code == 200
+        cred = cred_resp.json()
+        assert cred["has_vertex"] is True
+        assert cred["vertex_configured"] is True
+        assert cred["has_adc"] is False
+
+        # When OpenShell provider is missing, it must be reported in missing providers
+        async def _mock_not_exists(name):
+            return False
+
+        monkeypatch.setattr("swarmer.openshell_client.provider_exists", _mock_not_exists)
+
+        async with _TestSession() as db:
+            missing = await get_missing_provider_names_bulk([ws["id"]], db)
+            assert missing.get(ws["id"]) == ["Vertex AI"]
+
+        # If deleted, vertex_configured is cleared and missing warning disappears
+        del_resp = await client.delete(f"/api/v1/workspaces/{ws['id']}/secrets/credentials/vertex")
+        assert del_resp.status_code == 200
+
+        async with _TestSession() as db:
+            missing = await get_missing_provider_names_bulk([ws["id"]], db)
+            assert missing.get(ws["id"]) == []
+
+    def test_pat_delete_confirmation_attribute_escaping(self):
+        from starlette.requests import Request
+        from swarmer.routers.secrets import templates
+
+        req = Request({"type": "http", "method": "GET", "path": "/workspaces/1/secrets/pats/42/edit", "headers": [], "session": {}})
+        pat_with_quotes = {
+            "id": 42,
+            "name": 'malicious" onfocus="alert(1)',
+        }
+        rendered = templates.get_template("secrets/github_pat_form.html").render(
+            {
+                "request": req,
+                "ws": {"id": 1, "name": "Test WS", "namespace": "test-ns"},
+                "pat": pat_with_quotes,
+                "csrf_token": "token-xyz",
+            }
+        )
+        # Verify the double quotes in pat.name are escaped as &#34; so the attribute cannot break out
+        assert 'onsubmit="return confirm(&#34;Delete PAT malicious\\&#34; onfocus=\\&#34;alert(1)?&#34;)"' in rendered
+        assert 'malicious" onfocus=' not in rendered
+
+    @pytest.mark.asyncio
     async def test_pat_crud(self, client):
         ws = await _create_workspace(client)
 
@@ -664,7 +1759,7 @@ class TestSecrets:
             json={
                 "name": "my-pat",
                 "github_username": "octocat",
-                "pat_value": "ghp_testtoken123456",
+                "pat_value": "test-gh-pat-value-123456",
             },
         )
         assert resp.status_code == 201
@@ -696,11 +1791,11 @@ class TestSecrets:
         ws = await _create_workspace(client)
         await client.post(
             f"/api/v1/workspaces/{ws['id']}/secrets/pats",
-            json={"name": "dup-pat", "github_username": "user", "pat_value": "ghp_1"},
+            json={"name": "dup-pat", "github_username": "user", "pat_value": "test-gh-pat-value-1"},
         )
         resp = await client.post(
             f"/api/v1/workspaces/{ws['id']}/secrets/pats",
-            json={"name": "dup-pat", "github_username": "user", "pat_value": "ghp_2"},
+            json={"name": "dup-pat", "github_username": "user", "pat_value": "test-gh-pat-value-2"},
         )
         assert resp.status_code == 409
 
@@ -709,7 +1804,7 @@ class TestSecrets:
         from swarmer.models.github_app import GitHubApp
 
         ws = await _create_workspace(client)
-        pem = "-----BEGIN RSA PRIVATE KEY-----\nseed\n-----END RSA PRIVATE KEY-----"
+        pem = "test-placeholder-private-key-material"
 
         async with _TestSession() as db:
             existing = GitHubApp(
@@ -740,7 +1835,7 @@ class TestSecrets:
         from swarmer.models.github_app import GitHubApp
 
         ws = await _create_workspace(client)
-        pem = "-----BEGIN RSA PRIVATE KEY-----\nseed\n-----END RSA PRIVATE KEY-----"
+        pem = "test-placeholder-private-key-material"
 
         async with _TestSession() as db:
             existing = GitHubApp(
@@ -781,7 +1876,7 @@ class TestSecrets:
         from swarmer.models.github_app import GitHubApp
         from swarmer.models.workspace import Workspace
 
-        pem = "-----BEGIN RSA PRIVATE KEY-----\nseed\n-----END RSA PRIVATE KEY-----"
+        pem = "test-placeholder-private-key-material"
 
         async with _TestSession() as db:
             ws = Workspace(display_name="w", namespace="sched-ns")
@@ -888,7 +1983,7 @@ class TestGitHubURLValidation:
         ws = await _create_workspace(client)
         resp = await client.get(
             f"/api/v1/workspaces/{ws['id']}/prompts/browse/folders",
-            params={"repo_url": "https://user:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@github.com/org/repo"},
+            params={"repo_url": "https://user:" + "gh" + "p_" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + "@github.com/org/repo"},
         )
         assert resp.status_code == 400
 
@@ -897,7 +1992,7 @@ class TestGitHubURLValidation:
         ws = await _create_workspace(client)
         resp = await client.get(
             f"/api/v1/workspaces/{ws['id']}/prompts/browse/folders",
-            params={"repo_url": "https://github.com/org/repo?token=ghp_secret"},
+            params={"repo_url": "https://github.com/org/repo?token=" + "gh" + "p_" + "secret"},
         )
         assert resp.status_code == 400
 

@@ -1,5 +1,45 @@
 {# Inner partial — replaced on every scheduleListChanged event. #}
 
+{% macro event_help(popover_id) %}
+<span style="position:relative; display:inline-block; margin-left:4px;">
+  <button type="button" class="pf-v6-c-button pf-m-plain pf-m-small"
+          style="display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; min-width:18px; padding:0; border:1px solid #b8c0cc; border-radius:50%; background:#e7e9ed; color:#384152; font-size:12px; font-style:italic; font-weight:700; line-height:1; cursor:pointer;"
+          aria-label="Event trigger help" aria-expanded="false" aria-controls="{{ popover_id }}"
+          onclick="const p=document.getElementById('{{ popover_id }}'); const open=p.hidden; document.querySelectorAll('.schedule-help-popover').forEach(x=>x.hidden=true); document.querySelectorAll('[aria-controls^=sched-help-]').forEach(x=>x.setAttribute('aria-expanded','false')); p.hidden=!open; this.setAttribute('aria-expanded',String(!open));">i</button>
+  <div id="{{ popover_id }}" class="pf-v6-c-popover pf-m-bottom schedule-help-popover" role="dialog" hidden
+       style="position:absolute; z-index:10; left:0; top:calc(100% + 6px); width:320px; max-width:min(320px, 80vw); text-align:left;">
+    <div class="pf-v6-c-popover__arrow"></div>
+    <div class="pf-v6-c-popover__content">
+      <div class="pf-v6-c-popover__body" style="font-size:var(--pf-t--global--font--size--sm); white-space:normal; overflow-wrap:anywhere;">
+        <strong>Event conditions</strong>
+        <dl style="margin:var(--pf-t--global--spacer--xs) 0 var(--pf-t--global--spacer--sm);">
+          <dt style="font-weight:700;">CI Failure or Merge Conflict</dt>
+          <dd style="margin:0 0 var(--pf-t--global--spacer--xs);">Matches failed completed CI or a merge conflict.</dd>
+          <dt style="font-weight:700;">New PR or New Commits</dt>
+          <dd style="margin:0 0 var(--pf-t--global--spacer--xs);">Matches a PR with a new head commit; each head is dispatched only once.</dd>
+          <dt style="font-weight:700;">Review Comments</dt>
+          <dd style="margin:0 0 var(--pf-t--global--spacer--xs);">Matches PRs with unresolved review threads.</dd>
+          <dt style="font-weight:700;">Any Actionable PR State</dt>
+          <dd style="margin:0;">Matches any of the conditions above.</dd>
+        </dl>
+        <strong>Author scopes</strong>
+        <dl style="margin:var(--pf-t--global--spacer--xs) 0 var(--pf-t--global--spacer--sm);">
+          <dt style="font-weight:700;">All PRs</dt>
+          <dd style="margin:0 0 var(--pf-t--global--spacer--xs);">Allows any PR author.</dd>
+          <dt style="font-weight:700;">Team PRs</dt>
+          <dd style="margin:0 0 var(--pf-t--global--spacer--xs);">Allows trusted collaborators.</dd>
+          <dt style="font-weight:700;">Bot PRs</dt>
+          <dd style="margin:0 0 var(--pf-t--global--spacer--xs);">Allows recognized bot authors.</dd>
+          <dt style="font-weight:700;">My PRs</dt>
+          <dd style="margin:0;">Allows the configured Author Logins.</dd>
+        </dl>
+        <p style="margin:0;">The selected <strong>Prompt</strong> determines what the agent does after a match.</p>
+      </div>
+    </div>
+  </div>
+</span>
+{% endmacro %}
+
 {% if schedules %}
 <div style="display:flex; flex-direction:column; gap:var(--pf-t--global--spacer--sm); margin-bottom:var(--pf-t--global--spacer--md);">
   {% for sched in schedules %}
@@ -9,10 +49,20 @@
               {% if not sched.enabled %}opacity:0.55;{% endif %}">
     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:var(--pf-t--global--spacer--xs);">
       <div>
-        {% if sched.label %}
-        <span class="pf-v6-c-label pf-m-purple" style="margin-right:var(--pf-t--global--spacer--xs);"><span class="pf-v6-c-label__content">{{ sched.label }}</span></span>
+        {% if sched.trigger_type == 'event' %}
+          <span class="pf-v6-c-label pf-m-gold" style="margin-right:var(--pf-t--global--spacer--xs);"><span class="pf-v6-c-label__content">{{ sched.label or '⚡ GitHub Event' }}</span></span>
+          <code style="font-size:var(--pf-t--global--font--size--xs);">{{ event_conditions.get(sched.event_condition, sched.event_condition or 'Any Event') }} ({{ author_scopes.get(sched.author_scope, sched.author_scope) }})</code>
+        {% else %}
+          {% if sched.label %}
+          <span class="pf-v6-c-label pf-m-purple" style="margin-right:var(--pf-t--global--spacer--xs);"><span class="pf-v6-c-label__content">{{ sched.label }}</span></span>
+         {% endif %}
+         {% if sched.provider %}
+         <span class="pf-v6-c-label pf-m-blue" style="margin-left:var(--pf-t--global--spacer--xs);"><span class="pf-v6-c-label__content">{{ {'claude': 'Claude', 'gemini': 'Gemini', 'openai': 'OpenAI'}.get(sched.provider, sched.provider) }}</span></span>
+         {% else %}
+         <span style="margin-left:var(--pf-t--global--spacer--xs); font-size:var(--pf-t--global--font--size--xs); color:var(--pf-t--global--text--color--subtle);">· session provider</span>
+         {% endif %}
+          <code style="font-size:var(--pf-t--global--font--size--xs);">{{ sched.cron_schedule }}</code>
         {% endif %}
-        <code style="font-size:var(--pf-t--global--font--size--xs);">{{ sched.cron_schedule }}</code>
         {% if sched.prompt %}
         <span style="margin-left:var(--pf-t--global--spacer--xs); font-size:var(--pf-t--global--font--size--xs); color:var(--pf-t--global--text--color--subtle);">· {{ sched.prompt.display_name }}</span>
         {% else %}
@@ -33,6 +83,7 @@
         </form>
         {# Edit — expand an inline form #}
         <button type="button" class="pf-v6-c-button pf-m-small pf-m-secondary"
+                id="sched-edit-btn-{{ sched.id }}"
                 onclick="document.getElementById('sched-edit-{{ sched.id }}').style.display='block'; this.style.display='none';">Edit</button>
         {# Delete #}
         <form method="post"
@@ -40,22 +91,22 @@
               hx-post="/workspaces/{{ ws.id }}/sessions/{{ session.id }}/schedules/{{ sched.id }}/delete"
               hx-swap="none"
               style="display:inline;"
-              onsubmit="return confirm('Delete this schedule?');">
+              onsubmit="return confirm('Delete this trigger?');">
           <button type="submit" class="pf-v6-c-button pf-m-small pf-m-danger">Delete</button>
         </form>
       </div>
     </div>
-    {% if sched.cron_next_run %}
     <div style="margin-top:var(--pf-t--global--spacer--xs); font-size:var(--pf-t--global--font--size--xs); color:var(--pf-t--global--text--color--subtle);">
       {% if session.is_active and session.active_schedule_id == sched.id %}
         Currently running.
-      {% elif sched.enabled %}
-        Next: <strong>{{ sched.cron_next_run.strftime('%b %d, %Y %H:%M') }} UTC</strong>
-      {% else %}
+      {% elif not sched.enabled %}
         Disabled
+      {% elif sched.trigger_type == 'event' %}
+        ⚡ Event-driven (Monitored by Swarm PR Watcher)
+      {% elif sched.cron_next_run %}
+        Next: <strong>{{ sched.cron_next_run.strftime('%b %d, %Y %H:%M') }} UTC</strong>
       {% endif %}
     </div>
-    {% endif %}
 
     {# Inline edit form (hidden by default) #}
     <div id="sched-edit-{{ sched.id }}" style="display:none; margin-top:var(--pf-t--global--spacer--sm);">
@@ -64,18 +115,89 @@
             hx-post="/workspaces/{{ ws.id }}/sessions/{{ session.id }}/schedules/{{ sched.id }}/edit"
             hx-swap="none"
             style="display:flex; flex-direction:column; gap:var(--pf-t--global--spacer--sm);">
-        <div style="display:flex; gap:var(--pf-t--global--spacer--xs); flex-wrap:wrap; align-items:center;">
-          <input type="text" name="cron_expr" class="pf-v6-c-form-control"
-                 value="{{ sched.cron_schedule }}" placeholder="*/30 * * * *" required
-                 style="flex:1; min-width:140px; font-family:monospace; font-size:var(--pf-t--global--font--size--sm);">
-          <input type="text" name="label" class="pf-v6-c-form-control"
-                 value="{{ sched.label }}" placeholder="Label (optional)"
-                 style="flex:1; min-width:120px; font-size:var(--pf-t--global--font--size--sm);">
+        
+        {# Trigger Type Selector #}
+        <div style="display:flex; gap:var(--pf-t--global--spacer--md); align-items:center;">
+          <label style="font-size:var(--pf-t--global--font--size--sm); font-weight:bold;">Trigger Type:</label>
+          <label style="font-size:var(--pf-t--global--font--size--sm); cursor:pointer; display:inline-flex; align-items:center; gap:4px;">
+            <input type="radio" name="trigger_type" value="cron" {% if sched.trigger_type != 'event' %}checked{% endif %}
+                   onchange="document.getElementById('sched-cron-edit-{{ sched.id }}').style.display='block'; document.getElementById('sched-event-edit-{{ sched.id }}').style.display='none';">
+            🕒 Cron Schedule
+          </label>
+          <label style="font-size:var(--pf-t--global--font--size--sm); cursor:pointer; display:inline-flex; align-items:center; gap:4px;">
+            <input type="radio" name="trigger_type" value="event" {% if sched.trigger_type == 'event' %}checked{% endif %}
+                   onchange="document.getElementById('sched-cron-edit-{{ sched.id }}').style.display='none'; document.getElementById('sched-event-edit-{{ sched.id }}').style.display='block';">
+            ⚡ GitHub Event
+          </label>
         </div>
+
+        {# Cron Fields #}
+        <div id="sched-cron-edit-{{ sched.id }}" style="{% if sched.trigger_type == 'event' %}display:none;{% else %}display:block;{% endif %}">
+          <div>
+            <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Cron Expression (UTC)</label>
+            <input type="text" name="cron_expr" class="pf-v6-c-form-control"
+                   value="{{ sched.cron_schedule }}" placeholder="*/30 * * * *"
+                   style="font-family:monospace; font-size:var(--pf-t--global--font--size--sm);">
+          </div>
+          <div style="font-size:var(--pf-t--global--font--size--xs); color:var(--pf-t--global--text--color--subtle); margin-top:var(--pf-t--global--spacer--xs);">
+            min hour dom month dow (UTC) · <a href="https://crontab.guru/" target="_blank" rel="noopener">crontab.guru</a>
+          </div>
+        </div>
+
+        {# Event Fields #}
+        <div id="sched-event-edit-{{ sched.id }}" style="{% if sched.trigger_type == 'event' %}display:block;{% else %}display:none;{% endif %}">
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:var(--pf-t--global--spacer--sm);">
+             <div>
+               <div style="display:flex; align-items:center;"><label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Event Condition</label>{{ event_help('sched-help-edit-' ~ sched.id) }}</div>
+              <select name="event_condition" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
+                {% for cond_key, cond_name in event_conditions.items() %}
+                <option value="{{ cond_key }}" {% if sched.event_condition == cond_key %}selected{% endif %}>{{ cond_name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Author Scope</label>
+              <select name="author_scope" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
+                {% for scope_key, scope_name in author_scopes.items() %}
+                <option value="{{ scope_key }}" {% if sched.author_scope == scope_key %}selected{% endif %}>{{ scope_name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:var(--pf-t--global--spacer--xs);">
+             <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Author Logins (GitHub Logins, comma-separated)</label>
+            <input type="text" name="fix_authors" class="pf-v6-c-form-control"
+                   value="{{ sched.fix_authors }}" placeholder="e.g. alice, bob"
+                   style="width:100%; font-size:var(--pf-t--global--font--size--sm);">
+          </div>
+          <div class="pf-v6-c-check" style="margin-top:var(--pf-t--global--spacer--xs);">
+            <input class="pf-v6-c-check__input" type="checkbox" id="sched-include-context-{{ sched.id }}"
+                   name="include_event_context" value="1" {% if sched.include_event_context %}checked{% endif %}>
+            <label class="pf-v6-c-check__label" for="sched-include-context-{{ sched.id }}">Pass event details to the agent prompt</label>
+            <span class="pf-v6-c-check__description">Include the triggering GitHub event data in the run prompt.</span>
+          </div>
+        </div>
+
         <div>
-          <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Prompt override</label>
-          <select name="prompt_id" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
-            <option value="">(Use session default)</option>
+           <label style="font-size:var(--pf-t--global--text--color--subtle);">AI Provider</label>
+           <select name="provider" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
+             <option value="" {% if not sched.provider %}selected{% endif %}>Use session provider</option>
+             <option value="claude" {% if sched.provider == 'claude' %}selected{% endif %}>Claude / Vertex AI</option>
+             <option value="gemini" {% if sched.provider == 'gemini' %}selected{% endif %}>Gemini</option>
+             <option value="openai" {% if sched.provider == 'openai' %}selected{% endif %}>OpenAI</option>
+           </select>
+         </div>
+         <div>
+          <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Label (optional)</label>
+          <input type="text" name="label" class="pf-v6-c-form-control"
+                 value="{{ sched.label }}" placeholder="e.g. PR Fix / Nightly Sweep"
+                 style="width:100%; font-size:var(--pf-t--global--font--size--sm);">
+        </div>
+
+     <div>
+           <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Prompt <span style="color:var(--pf-t--global--danger--color--100);">(required)</span></label>
+           <select name="prompt_id" class="pf-v6-c-form-control" required style="font-size:var(--pf-t--global--font--size--sm);">
+             {% if not sched.prompt_id %}<option value="" disabled selected>Select a prompt</option>{% endif %}
             {% for source in prompt_sources %}
             <optgroup label="{{ source.name }}">
               {% for p in source.prompts %}
@@ -94,7 +216,7 @@
         <div style="display:flex; gap:var(--pf-t--global--spacer--xs);">
           <button type="submit" class="pf-v6-c-button pf-m-primary pf-m-small">Save</button>
           <button type="button" class="pf-v6-c-button pf-m-secondary pf-m-small"
-                  onclick="document.getElementById('sched-edit-{{ sched.id }}').style.display='none'; this.closest('form').previousElementSibling.previousElementSibling.previousElementSibling.querySelector('button[onclick]').style.display='inline-block';">Cancel</button>
+                  onclick="document.getElementById('sched-edit-{{ sched.id }}').style.display='none'; document.getElementById('sched-edit-btn-{{ sched.id }}').style.display='inline-block';">Cancel</button>
         </div>
       </form>
     </div>
@@ -102,43 +224,111 @@
   {% endfor %}
 </div>
 {% else %}
-<p style="color:var(--pf-t--global--text--color--subtle); font-size:var(--pf-t--global--font--size--sm); margin-bottom:var(--pf-t--global--spacer--md);">No schedules yet. Add one below.</p>
+<p style="color:var(--pf-t--global--text--color--subtle); font-size:var(--pf-t--global--font--size--sm); margin-bottom:var(--pf-t--global--spacer--md);">No triggers configured yet. Add one below.</p>
 {% endif %}
 
-{# Add Schedule form #}
+{# Add Trigger form #}
 <details id="schedule-add-toggle">
-  <summary style="font-size:var(--pf-t--global--font--size--sm); cursor:pointer; font-weight:var(--pf-t--global--font--weight--heading--bold); margin-bottom:var(--pf-t--global--spacer--sm);">+ Add schedule</summary>
+  <summary style="font-size:var(--pf-t--global--font--size--sm); cursor:pointer; font-weight:var(--pf-t--global--font--weight--heading--bold); margin-bottom:var(--pf-t--global--spacer--sm);">+ Add trigger / schedule</summary>
   <form method="post"
         action="/workspaces/{{ ws.id }}/sessions/{{ session.id }}/schedules"
         hx-post="/workspaces/{{ ws.id }}/sessions/{{ session.id }}/schedules"
         hx-swap="none"
         hx-on::after-request="if(event.detail.successful){this.reset();}"
         style="display:flex; flex-direction:column; gap:var(--pf-t--global--spacer--sm); margin-top:var(--pf-t--global--spacer--sm);">
-    <div style="margin-bottom:var(--pf-t--global--spacer--xs);">
-      <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle); display:block; margin-bottom:var(--pf-t--global--spacer--xs);">Quick presets</label>
-      <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:var(--pf-t--global--spacer--xs);">
-        {% for expr, lbl in cron_presets.items() %}
-        <button type="button" class="pf-v6-c-button pf-m-secondary pf-m-small"
-                onclick="this.closest('form').querySelector('[name=cron_expr]').value='{{ expr }}'; this.closest('form').querySelector('[name=label]').value='{{ lbl }}';"
-                style="width:100%;">{{ lbl }}</button>
-        {% endfor %}
+    
+    {# Trigger Type Selector #}
+    <div style="display:flex; gap:var(--pf-t--global--spacer--md); align-items:center;">
+      <label style="font-size:var(--pf-t--global--font--size--sm); font-weight:bold;">Trigger Type:</label>
+      <label style="font-size:var(--pf-t--global--font--size--sm); cursor:pointer; display:inline-flex; align-items:center; gap:4px;">
+        <input type="radio" name="trigger_type" value="cron" checked
+               onchange="document.getElementById('sched-add-cron-fields').style.display='block'; document.getElementById('sched-add-event-fields').style.display='none';">
+        🕒 Cron Schedule
+      </label>
+      <label style="font-size:var(--pf-t--global--font--size--sm); cursor:pointer; display:inline-flex; align-items:center; gap:4px;">
+        <input type="radio" name="trigger_type" value="event"
+               onchange="document.getElementById('sched-add-cron-fields').style.display='none'; document.getElementById('sched-add-event-fields').style.display='block';">
+        ⚡ GitHub Event
+      </label>
+    </div>
+
+    {# Cron Add Fields #}
+    <div id="sched-add-cron-fields">
+      <div style="margin-bottom:var(--pf-t--global--spacer--xs);">
+        <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle); display:block; margin-bottom:var(--pf-t--global--spacer--xs);">Quick presets</label>
+        <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:var(--pf-t--global--spacer--xs);">
+          {% for expr, lbl in cron_presets.items() %}
+          <button type="button" class="pf-v6-c-button pf-m-secondary pf-m-small"
+                  onclick="this.closest('form').querySelector('[name=cron_expr]').value='{{ expr }}'; this.closest('form').querySelector('[name=label]').value='{{ lbl }}';"
+                  style="width:100%;">{{ lbl }}</button>
+          {% endfor %}
+        </div>
+      </div>
+      <div>
+        <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Cron Expression (UTC)</label>
+        <input type="text" name="cron_expr" class="pf-v6-c-form-control"
+               placeholder="*/30 * * * *"
+               style="font-family:monospace; font-size:var(--pf-t--global--font--size--sm);">
+      </div>
+      <div style="font-size:var(--pf-t--global--font--size--xs); color:var(--pf-t--global--text--color--subtle); margin-top:var(--pf-t--global--spacer--xs);">
+        min hour dom month dow (UTC) · <a href="https://crontab.guru/" target="_blank" rel="noopener">crontab.guru</a>
       </div>
     </div>
-    <div style="display:flex; gap:var(--pf-t--global--spacer--xs); flex-wrap:wrap; align-items:center;">
-      <input type="text" name="cron_expr" class="pf-v6-c-form-control"
-             placeholder="*/30 * * * *" required
-             style="flex:1; min-width:140px; font-family:monospace; font-size:var(--pf-t--global--font--size--sm);">
-      <input type="text" name="label" class="pf-v6-c-form-control"
-             placeholder="Label (optional)"
-             style="flex:1; min-width:120px; font-size:var(--pf-t--global--font--size--sm);">
+
+    {# Event Add Fields #}
+    <div id="sched-add-event-fields" style="display:none;">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:var(--pf-t--global--spacer--sm);">
+        <div>
+          <div style="display:flex; align-items:center;"><label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Event Condition</label>{{ event_help('sched-help-add') }}</div>
+          <select name="event_condition" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
+            {% for cond_key, cond_name in event_conditions.items() %}
+            <option value="{{ cond_key }}">{{ cond_name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Author Scope</label>
+          <select name="author_scope" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
+            {% for scope_key, scope_name in author_scopes.items() %}
+            <option value="{{ scope_key }}">{{ scope_name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div style="margin-top:var(--pf-t--global--spacer--xs);">
+         <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Author Logins (GitHub Logins, comma-separated)</label>
+        <input type="text" name="fix_authors" class="pf-v6-c-form-control"
+               placeholder="e.g. alice, bob"
+               style="width:100%; font-size:var(--pf-t--global--font--size--sm);">
+      </div>
+      <div class="pf-v6-c-check" style="margin-top:var(--pf-t--global--spacer--xs);">
+        <input class="pf-v6-c-check__input" type="checkbox" id="sched-add-include-context"
+               name="include_event_context" value="1" checked>
+        <label class="pf-v6-c-check__label" for="sched-add-include-context">Pass event details to the agent prompt</label>
+        <span class="pf-v6-c-check__description">Include the triggering GitHub event data in the run prompt.</span>
+      </div>
     </div>
-    <div style="font-size:var(--pf-t--global--font--size--xs); color:var(--pf-t--global--text--color--subtle);">
-      min hour dom month dow (UTC) · <a href="https://crontab.guru/" target="_blank" rel="noopener">crontab.guru</a>
-    </div>
+
     <div>
-      <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Prompt override</label>
-      <select name="prompt_id" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
-        <option value="">(Use session default)</option>
+      <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Label (optional)</label>
+      <input type="text" name="label" class="pf-v6-c-form-control"
+             placeholder="e.g. PR Fix / Nightly Sweep"
+             style="width:100%; font-size:var(--pf-t--global--font--size--sm);">
+    </div>
+
+     <div>
+       <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">AI Provider</label>
+       <select name="provider" class="pf-v6-c-form-control" style="font-size:var(--pf-t--global--font--size--sm);">
+         <option value="" selected>Use session provider</option>
+         <option value="claude">Claude / Vertex AI</option>
+         <option value="gemini">Gemini</option>
+         <option value="openai">OpenAI</option>
+       </select>
+     </div>
+     <div>
+       <label style="font-size:var(--pf-t--global--font--size--sm); color:var(--pf-t--global--text--color--subtle);">Prompt <span style="color:var(--pf-t--global--danger--color--100);">(required)</span></label>
+       <select name="prompt_id" class="pf-v6-c-form-control" required style="font-size:var(--pf-t--global--font--size--sm);">
+         <option value="" disabled selected>Select a prompt</option>
         {% for source in prompt_sources %}
         <optgroup label="{{ source.name }}">
           {% for p in source.prompts %}
@@ -155,10 +345,10 @@
                 style="min-height:80px; font-size:var(--pf-t--global--font--size--sm); margin-top:var(--pf-t--global--spacer--xs); resize:vertical;"></textarea>
     </details>
     <div>
-      <button type="submit" class="pf-v6-c-button pf-m-primary pf-m-small">Add Schedule</button>
+      <button type="submit" class="pf-v6-c-button pf-m-primary pf-m-small">Add Trigger</button>
     </div>
     <p style="color:var(--pf-t--global--text--color--subtle); font-size:var(--pf-t--global--font--size--xs); margin:0;">
-      Scheduled runs always execute in Prompt mode.
+      Triggered & scheduled runs execute in Prompt mode.
     </p>
   </form>
 </details>

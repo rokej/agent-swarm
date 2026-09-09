@@ -20,9 +20,24 @@ agent-swarm/
 ├── docs/                       # Documentation
 │   ├── USER_GUIDE.md           # Full user-facing guide
 │   └── ARCHITECTURE.md         # This file
+├── practices/                  # Operational best practices
+│   └── autonomous-sdlc/        # Autonomous agent workflows
+│       └── swarm-pr-watcher.md # In-process PR watcher operations & troubleshooting
+├── prompts/                    # Headless autonomous agent prompts
+│   └── auto-pr-fix-agent.md    # Autonomous prompt for fixing conflicts, CI, comments
+├── scripts/                    # Automation, smoke tests, and CLI helpers
+│   ├── mcp_setup.py            # CLI setup for opencode.json + token discovery
+│   ├── openshell_connect.py    # Multi-cluster OpenShell port-forward helper
+│   ├── openshell_smoke_test.py # Sandbox runtime e2e verification
+│   └── openshell_jira_smoke_test.py # Jira MCP server e2e policy verification
 ├── mcp-server/                 # Standalone MCP server for session orchestration
-├── tests/                      # Test suite
+│   ├── pyproject.toml          # MCP server packaging
+│   ├── agent_swarm_mcp_server/ # FastMCP server, REST API client, auth resolution
+│   └── tests/                  # Client & tool unit tests (respx mocked)
+├── tests/                      # Swarmer test suite
 │   ├── test_api.py              # REST API unit tests (in-memory SQLite, no server)
+│   ├── test_token_page.py       # /token UI and mcp_setup script unit tests
+│   ├── test_k8s_auth.py         # TokenReview & OpenShift OAuth fallback tests
 │   ├── test_list_repos_for_pat.py  # GitHub API helpers (respx mocking)
 │   ├── test_openshell_client.py # OpenShell client wrapper tests (mocked SDK, no package required)
 │   └── test_ui_patternfly.py   # Playwright e2e tests (requires running server at :8091)
@@ -31,7 +46,8 @@ agent-swarm/
     ├── config.py               # pydantic-settings Settings singleton
     ├── database.py             # SQLAlchemy async engine + session factory + migrations
     ├── crypto.py               # Fernet encrypt/decrypt from secret key file or env var
-    ├── k8s_auth.py             # K8s TokenReview validation, namespace access check, RBAC probing
+    ├── k8s_auth.py             # K8s TokenReview validation & OpenShift OAuth fallback
+    ├── workspace_acl.py        # Database-backed workspace ACL (owner/member/admin) — ACM-41659
     ├── deps.py                 # FastAPI dependencies (require_auth, get_user_token)
     ├── k8s.py                  # Kubernetes utility functions (namespace, pull secrets, image check, extra env vars)
     ├── mcp_catalog.py          # Registry of well-known MCP servers (Jira, etc.) with OAuth defaults
@@ -47,16 +63,18 @@ agent-swarm/
     │   └── opencode.py         # OpenCode strategy (Vertex AI Anthropic/Gemini models)
     ├── models/                 # SQLAlchemy ORM models
     │   ├── __init__.py         # Imports all models (required for Base.metadata)
-    │   ├── workspace.py        # Workspace → K8s namespace (or shared via settings.k8s_namespace)
+    │   ├── workspace.py        # Workspace (owner_id + derived namespace slug for legacy K8s secrets)
+    │   ├── workspace_member.py # Explicit per-user workspace access grants (ACM-41659)
+    │   ├── global_admin.py     # Self-service global admins (ACM-41659)
     │   ├── session.py          # Session (sandbox lifecycle, modes: tui/server/prompt, cron scheduling)
     │   ├── session_repo.py     # Git repos attached to sessions (cloned into sandbox at launch)
     │   ├── sandbox_env_var.py  # Per-workspace env vars (encrypted at rest, injected into sandboxes)
-    │   ├── opencode_secret.py  # Fernet-encrypted provider credentials (GCP/Gemini)
+    │   ├── opencode_secret.py  # GCP project/location (DB); ADC + Gemini key are gateway-only (ACM-37263)
     │   ├── github_pat.py       # Fernet-encrypted GitHub PATs for HTTPS git auth
     │   ├── github_app.py       # Fernet-encrypted GitHub App credentials (one per workspace)
     │   └── mcp_server.py       # MCP server configs with Fernet-encrypted OAuth tokens
     ├── routers/                # FastAPI route handlers
-    │   ├── auth.py             # /login (token paste + OpenShift OAuth), /logout, /auth/callback
+    │   ├── auth.py             # /login (token paste + OpenShift OAuth), /logout, /token, /auth/callback
     │   ├── workspaces.py       # CRUD for workspaces
     │   ├── sessions.py         # CRUD + launch/stop/schedule/patch generation + repo management
     │   ├── secrets.py          # OpenCode secrets, GitHub PATs, GitHub App, pull secrets
@@ -66,7 +84,9 @@ agent-swarm/
     ├── api/v1/                 # REST API — 51 endpoints under /api/v1/
     └── templates/              # Jinja2 HTML templates (PatternFly 6 dark theme + HTMX)
         ├── base.html           # Layout with masthead, flash messages, PatternFly CDN
-        ├── workspaces/         # list, detail, new, edit, _delete_confirm
+        ├── token.html          # Active bearer token, opencode.json snippet, 1-click copy
+        ├── workspaces/         # list, detail, new, edit, _delete_confirm, members
+        ├── admins/             # list, bootstrap
         ├── sessions/           # list, detail, new, _status_badge, _last_output, _repo_list, etc.
         ├── secrets/            # tabs, opencode_form, github_pat_form, github_pat_list
         └── mcp_servers/        # list (catalog + configured servers with OAuth status)
@@ -78,18 +98,21 @@ agent-swarm/
 
 **OpenShell is the sole session runtime** — All agent session lifecycle (create, exec, stop, delete) goes through the OpenShell Gateway + Supervisor APIs. Swarmer does not create K8s pods, PVCs, Services, or Routes for agent sessions.
 
-**Minimal K8s surface** — Swarmer's K8s usage is limited to: authentication (TokenReview via `k8s_auth.py`), image pull secrets (for `check_image_reachable`), and workspace namespace scoping. All credential injection for agent sessions is handled by the OpenShell Gateway.
+**Minimal K8s surface** — Swarmer's K8s usage is limited to: authentication (TokenReview via `k8s_auth.py`, identity only — no RBAC checks), image pull secrets (for `check_image_reachable`; the K8s namespace they live in is created lazily on first use, ACM-41659), and Add Member / Add Admin candidate discovery (`k8s.list_openshift_users()`, `k8s.list_user_service_accounts()`, both best-effort/read-only). Workspace access control itself is a database ACL (`workspace_acl.py`), not K8s RBAC or namespace scoping. All credential injection for agent sessions is handled by the OpenShell Gateway.
 
 ## Domain Model
 
-- **Workspace** maps to a Kubernetes namespace for scoping purposes. All resources (sessions, secrets) are scoped to a workspace. When `settings.k8s_namespace` is set (namespace-scoped deployment), all workspaces share a single K8s namespace via `Workspace.k8s_namespace` property.
+- **Workspace** is a logical grouping for sessions/secrets, backed purely by the database (ACM-41659) — access is a database ACL (`Workspace.owner_id` + `workspace_members` rows + configured admin allow-list, see `workspace_acl.py`), not a per-workspace Kubernetes namespace. `Workspace.namespace` is still a derived slug used to name a handful of legacy per-workspace K8s Secrets (pull secrets) that are lazily created on first use via `Workspace.k8s_namespace` (or a single shared namespace when `settings.k8s_namespace` is set).
 - **Session** = an agent run inside an OpenShell sandbox. Three modes:
   - `prompt` — one-shot: runs the agent with a prompt, sandbox exits on completion, sandbox auto-deleted on success
   - `server` — persistent: runs the agent in server mode, exposes a service via OpenShell `expose_service()`, dashboard proxies HTTP/WS/SSE to it
   - `tui` — persistent: runs `sleep infinity`; user connects via xterm.js WebSocket → OpenShell `exec_interactive()` PTY
 - **Session phases**: `idle` → `pending` → `running` → `succeeded`/`failed`/`stopped`
-- **Cron scheduling** — sessions of any mode can have a cron schedule (`cron_schedule` field). A background asyncio loop (`scheduler.py`) checks every 30s, uses an atomic `UPDATE … RETURNING` to claim due rows (prevents duplicates), sets `session.mode = "prompt"` before calling `_do_launch()` (scheduled runs always execute in prompt mode regardless of the session's configured mode), then calls the shared `_do_launch()` helper in `sessions.py`.
-- **OpencodeSecret** — per-workspace encrypted storage for GCP project, Vertex location, ADC JSON, and Google API key. Stored in SQLite via Fernet encryption. Despite the legacy name, used by OpenCode. Multiple rows per workspace are tolerated (one per `user_id`); read paths use `.scalars().first()` to avoid `MultipleResultsFound` when users share a workspace. A `UNIQUE (workspace_id, user_id)` constraint prevents future duplicates, with a deduplication migration that keeps the newest row per pair.
+- **Multi-Trigger Model (`SessionSchedule`)** — sessions can have multiple execution triggers (ACM-35377, ACM-42674) with `trigger_type` set to either `"cron"` or `"event"`:
+  - `"cron"`: Scheduled time triggers (`cron_schedule`, `cron_next_run`). A background loop (`scheduler.py`) evaluates due schedules every 30s, atomically claims rows, sets `session.mode = "prompt"`, and launches the session.
+  - `"event"`: GitHub PR event triggers (`event_condition`, `author_scope`, `fix_authors`). Evaluated and dispatched by the in-process Swarm PR Watcher loop (`swarmer/pr_watcher.py`) upon receiving actionable GitHub events (CI failures, conflicts, new commits, review comments).
+- **SessionRun** — historical record of completed executions (`session_runs` table). Captures phase, duration, dual outputs (`last_output`, `raw_output`), `trigger_type` (`"manual"`, `"cron"`, `"event"`), `schedule_label`, and serialized `event_context` (PR metadata for event-driven runs).
+- **OpencodeSecret** — per-workspace storage for GCP project and Vertex location (plain, non-secret SQLite `Text` columns — not Fernet-encrypted, since they carry no sensitive material). Despite the legacy name, used by OpenCode. The ADC JSON and the Google AI Studio (Gemini) API key are **not** persisted here via the UI — both are pushed directly to OpenShell gateway providers at save time (`swarmer-ws-{id}-google-cloud` and `swarmer-ws-{id}-google-ai-studio` respectively) and checked at launch/display time via `provider_exists()` (ACM-37263 completed the Gemini side of this pattern, mirroring the pre-existing ADC behavior). The model's `application_default_credentials_enc` / `google_api_key_enc` columns are retained only for backward compatibility with rows written before each migration and via the raw `POST /api/v1/.../secrets/credentials` API, which still accepts and stores them encrypted. Multiple rows per workspace are tolerated (one per `user_id`); read paths use `.scalars().first()` to avoid `MultipleResultsFound` when users share a workspace. A `UNIQUE (workspace_id, user_id)` constraint prevents future duplicates, with a deduplication migration that keeps the newest row per pair.
 - **GitHubPAT** — per-workspace encrypted GitHub personal access tokens with optional org scope for HTTPS git auth. Injected into OpenShell sandboxes via Gateway credential providers. Acts as fallback when no GitHub App is configured.
 - **GitHubApp** — one GitHub App installation per workspace, storing `app_id`, `installation_id`, and a Fernet-encrypted RSA private key (`private_key_enc`). At session launch, Swarmer mints a short-lived Installation Access Token (IAT) server-side using PyJWT + GitHub's REST API and injects it into the sandbox via the OpenShell Gateway provider — the raw PEM key never enters the sandbox. For TUI and server-mode sessions that may exceed the 1-hour token lifetime, a background asyncio task (`github_auth.start_token_refresh_loop`) re-mints and re-registers the provider every 50 minutes. See [docs/GITHUB_APP_SETUP.md](GITHUB_APP_SETUP.md) for setup steps and required permissions.
 - **McpServer** — per-workspace MCP server configurations with OAuth 2.1 tokens encrypted at rest. Enabled servers are configured in the agent config JSON and credentials injected via Gateway env vars.
@@ -113,13 +136,15 @@ Token-based auth via Kubernetes bearer tokens (not password-based):
 - Users paste a K8s ServiceAccount token into the login form
 - Token validated via TokenReview API (`k8s_auth.py`); falls back to namespace probe if RBAC for tokenreviews is missing
 - Validated token is Fernet-encrypted and stored in the session cookie (`deps.py:get_user_token()`)
-- Workspace access controlled by K8s RBAC: `get_accessible_namespaces()` checks pods `list` in each workspace namespace (via namespace-scoped `swarmer-user` RoleBinding), or cluster-scoped `namespaces` `get` for admin bindings
+- Workspace access is a database ACL (ACM-41659, `workspace_acl.py`), not K8s RBAC: a user may access a workspace as its owner (`Workspace.owner_id`), an explicit `WorkspaceMember` row, a global admin (`WORKSPACE_ADMIN_USERS` / `WORKSPACE_ADMIN_GROUPS` env vars, or the self-service `global_admins` DB table / `/admins` UI), or — while a workspace has no owner yet — any authenticated user ("claim on write": the first management action claims ownership). Shared-namespace deployments (`K8S_NAMESPACE` set) grant every authenticated user access to every workspace. `k8s_auth.py` only authenticates identity (username + groups); it performs no SelfSubjectAccessReview calls.
+- `workspace_acl.list_known_users()` / `GET /api/v1/users` back the Add Member / Add Admin autocomplete (both forms use the same discovery — exclusions differ by call site). Merges three sources: DB-known users (visibility-scoped — people who already share a workspace with the caller; admins see everyone, never a global directory for non-admins), `k8s.list_openshift_users()` (OpenShift `User` objects, cluster-scoped, `[]` off-OpenShift), and `k8s.list_user_service_accounts()` (ServiceAccounts `make user-token SA_USER=<name>` would create, formatted as `system:serviceaccount:<ns>:<name>`). Both K8s helpers are best-effort and never raise. Free-text entry on those forms is always still allowed; suggestions never restrict who can actually be granted access.
+- Startup migration (`workspace_migration.py` + SQL in `database.py:migrate_db()`) backfills `workspace_members`/`owner_id` from existing per-user credential rows and legacy `swarmer-user` K8s RoleBindings, so upgrading never requires re-adding users.
 - Optional OpenShift OAuth: implicit grant flow via `/auth/callback` (captures token from URL fragment client-side)
 - `swarmer/auth.py` is superseded — just contains a comment pointing to `k8s_auth.py`
 
 ## Encryption
 
-All sensitive fields (PATs, API keys, ADC credentials) are Fernet-encrypted at rest in SQLite.
+All sensitive fields that are actually persisted in the DB (PATs, GitHub App private key, Jira tokens) are Fernet-encrypted at rest in SQLite. The ADC JSON and Gemini API key are the notable exceptions — via the UI they go to the OpenShell gateway only and are never written to SQLite (see OpencodeSecret above); their `_enc` columns exist solely for the raw API path and backward compatibility.
 
 - Key source (in priority order): `SWARMER_SECRET_KEY` env var → `auth/secret.key` file → auto-generated on first run
 - Key must decode to exactly 32 bytes (base64url-encoded)
@@ -144,12 +169,13 @@ All sensitive fields (PATs, API keys, ADC credentials) are Fernet-encrypted at r
 Swarmer uses the official `kubernetes` Python client for a limited set of infrastructure operations. All agent session lifecycle is handled by OpenShell — Swarmer does not create pods, PVCs, Services, or Routes for sessions.
 
 **Active K8s usage:**
-- `k8s_auth.py` — TokenReview for user authentication; namespace access validation
+- `k8s_auth.py` — TokenReview for user authentication (identity only — no RBAC/authorization checks; see Auth Flow above)
 - `k8s.init_k8s()` — loads in-cluster or kubeconfig at startup
-- `k8s.ensure_namespace()` / `delete_namespace()` — workspace namespace lifecycle
-- `k8s.effective_namespace()` — resolves the effective K8s namespace for a workspace
+- `k8s.ensure_namespace()` / `delete_namespace()` — **no longer called at workspace create/delete time** (ACM-41659). A workspace's K8s namespace (`k8s.effective_namespace()`) is now created lazily, only the first time a legacy per-workspace K8s Secret feature (pull secrets) is actually used, and best-effort deleted when the workspace is deleted.
 - Pull secret management (`apply_pull_secret`, `get_pull_secret_info`, `delete_pull_secret`) — required for `check_image_reachable`
 - `get_extra_env_vars()` / `set_extra_env_var()` / `delete_extra_env_var()` — workspace env var storage via K8s Secret `swarmer-agent-extra-env` (**ACM-35039**: migrating to SQLite)
+- `k8s.list_swarmer_user_role_binding_identities()` — read-only, used once at startup by `workspace_migration.py` to mirror legacy `swarmer-user` RoleBinding grants into the DB ACL (ACM-41659); never writes RoleBindings anymore
+- `k8s.list_openshift_users()` / `k8s.list_user_service_accounts()` — read-only, back the Add Member / Add Admin candidate discovery (`workspace_acl.list_known_users()` / `GET /api/v1/users`); both best-effort, never raise
 
 All kubernetes client imports remain lazy (inside functions) to avoid import errors when K8s is not configured.
 
@@ -160,7 +186,7 @@ All kubernetes client imports remain lazy (inside functions) to avoid import err
 - **Gateway** -- credential injection API; Swarmer sends AI tokens, PATs, and MCP tokens to the Gateway, which injects them as env vars into the sandbox. No K8s Secrets written for session credentials.
 - **Supervisor** -- sandboxed agent runtime; `create_sandbox()` provisions the sandbox, `delete_sandbox()` tears it down.
 - **Sandbox lifecycle** -- fully managed by OpenShell. No K8s pods, PVCs, or Services created for sessions.
-- **No PVCs** -- sandbox filesystem is ephemeral; repos are cloned fresh each launch via OpenShell API.
+- **`/sandbox` PVC** -- OpenShell creates a per-sandbox PVC (`workspace-{sandbox-name}`) for `/sandbox`, sized by the gateway's `server.workspaceDefaultStorageSize` Helm value; Swarmer does not create this PVC directly (see the OpenShell Client API table below for the distinct, hardcoded `10Gi` pod `ephemeral-storage` compute resource). Repos are cloned fresh each launch via OpenShell API.
 - **No session K8s Secrets** -- all credential injection goes through the Gateway provider mechanism.
 - **`session.sandbox_name`** -- stores the OpenShell sandbox identifier (nullable `VARCHAR(255)`, `NULL` when session is idle).
 - **Network policy** -- `openshell_policy.py` builds per-sandbox YAML policies controlling outbound access (AI provider endpoints, per-repo GitHub, Jira MCP)
@@ -179,7 +205,7 @@ All kubernetes client imports remain lazy (inside functions) to avoid import err
 | `configure_vertex_provider()` | `async (provider_name, adc_json, project, location, client?) → None` | Configures google-vertex-ai provider with ADC-based token refresh |
 | `enable_providers_v2()` | `async (client?) → None` | Enables `providers_v2_enabled` gateway feature flag (required for google-vertex-ai) |
 | `set_cluster_inference()` | `async (provider_name, model_id, no_verify?, client?) → None` | Configures inference.local cluster proxy to use a provider+model |
-| `create_sandbox()` | `async (image, env_vars, policy, provider_names?, ephemeral_storage?, client?) → SandboxRef` | Creates sandbox, waits ready, returns ref. `ephemeral_storage` (e.g. `"5Gi"`), sourced per-session from `Session.ephemeral_disk` (ACM-38184), sets `SandboxTemplate.resources` requests/limits — empty string leaves it unset. This only bounds the sandbox pod's ephemeral-storage compute resource (container writable layer / unsized emptyDirs); it does **not** resize `/sandbox`, which is a separate PVC (`workspace-{sandbox-name}`) sized by the gateway's `server.workspaceDefaultStorageSize` Helm value (`OPENSHELL_WORKSPACE_STORAGE` in the Makefile, default `10Gi`) — see ACM-38172, ACM-38184 |
+| `create_sandbox()` | `async (image, env_vars, policy, provider_names?, client?) → SandboxRef` | Creates sandbox, waits ready, returns ref. Every sandbox gets a hardcoded `SandboxTemplate.resources` ephemeral-storage request/limit of `SANDBOX_EPHEMERAL_STORAGE` (`10Gi`, ACM-39804 — previously a per-session dropdown, ACM-38184, removed because it only bounded this compute resource, not `/sandbox`). `/sandbox` is a separate PVC (`workspace-{sandbox-name}`) sized by the gateway's `server.workspaceDefaultStorageSize` Helm value (`OPENSHELL_WORKSPACE_STORAGE` in the Makefile) — see ACM-38172 |
 | `delete_sandbox()` | `async (sandbox_name, client?) → None` | Deletes sandbox by name |
 | `write_agent_config()` | `async (sandbox_name, tool_name, config_json, client?) → None` | Writes tool config JSON to `/sandbox/{tool}.json` |
 | `write_agents_md()` | `async (sandbox_name, content, client?) → None` | Writes AGENTS.md to `/sandbox/` |
@@ -221,7 +247,20 @@ All settings live in `swarmer/config.py` (`Settings` class) and are read from en
 | `openshell_bearer_token` | `OPENSHELL_BEARER_TOKEN` | `str` | `""` | Bearer token for Gateway/Supervisor authentication |
 | `sandbox_gc_interval` | `SANDBOX_GC_INTERVAL` | `int` | `300` | Seconds between sandbox garbage-collection sweeps |
 
-> **Ephemeral disk (ACM-38184):** Sandbox ephemeral-storage is a **per-session** setting (`Session.ephemeral_disk`, one of `2Gi`/`5Gi`/`10Gi`, default `2Gi`), configurable via a dropdown on the session create/edit UI — not a global env var. It bounds the sandbox pod's ephemeral-storage compute resource (container writable layer / unsized emptyDirs) and is passed to `create_sandbox(ephemeral_storage=...)` at launch. It does **not** resize the `/sandbox` working directory — see `workspaceDefaultStorageSize` below.
+> **Ephemeral disk (ACM-39804):** Sandbox pod ephemeral-storage is a **hardcoded** value (`openshell_client.SANDBOX_EPHEMERAL_STORAGE`, `10Gi`), applied to every sandbox — not a per-session or env-var setting. A per-session dropdown (`Session.ephemeral_disk`, ACM-38184) previously existed but was removed: it only bounded the sandbox pod's ephemeral-storage compute resource (container writable layer / unsized emptyDirs), which users don't perceive as "disk size" and which is not the `/sandbox` working directory — see `workspaceDefaultStorageSize` below. There is no OpenShell API (verified through gateway/SDK 0.0.97) to size `/sandbox` per sandbox.
+
+### Dedicated Per-Workspace OpenShell Gateways (ACM-41655)
+
+Any workspace can be configured to run its sessions on its **own dedicated OpenShell gateway** (e.g. a remote/hosted OpenShell instance) instead of the shared cluster-default gateway, with **zero Swarmer pod restarts** and full side-by-side coexistence between "shared" and "dedicated" workspaces.
+
+- **Data model** — `swarmer/models/workspace_gateway.py`: 1-to-1 `WorkspaceGateway` row per workspace (`workspace_gateways` table, `database.py:migrate_db()`). Fields: `gateway_url`, `auth_mode` (`oidc`|`bearer`|`mtls`|`none`), OIDC issuer/client_id/audience, and encrypted `refresh_token_enc`/`access_token_enc`/`bearer_token_enc`/`tls_key_enc` (via `crypto.encrypt()`/`decrypt()` — never plaintext, per the Sensitive Data Policy). `Workspace.gateway` is the relationship; a workspace with no row (or an empty `gateway_url`) transparently falls back to the global default gateway (`OPENSHELL_GATEWAY_URL` etc. in `config.py`).
+- **`GatewayConfig` descriptor** (`swarmer/openshell_client.py`) — frozen dataclass carrying `gateway_url`, `auth_mode`, TLS paths, `bearer_token`/`bearer_callable`, and `workspace_id`. `default_gateway_config()` builds one from global `settings` (where `tls_ca`/`tls_cert`/`tls_key` are already real filesystem paths); `resolve_gateway_config(ws_or_id, db)` resolves the workspace-specific one (querying `WorkspaceGateway` when a `Workspace`/int id + `AsyncSession` are given) and falls back to the default. `get_client_for_config()` builds the actual `SandboxClient` — since `WorkspaceGateway.tls_ca`/`tls_cert`/`tls_key` store raw PEM *content* (not paths) in the DB, `_tls_material_path()` transparently spools inline PEM content to a private (0600) temp file before handing it to the openshell SDK's path-only `TlsConfig`, deleting the temp file immediately after the (synchronous, constructor-time) credential read; a value that is already a real file (the global-settings case) is used unchanged. `get_client_for_workspace(ws_or_id, db)` is the common entry point used by call sites — it returns `None` when the workspace has no custom gateway (letting the caller fall through to the legacy global-default `_get_client()` path unchanged) or a workspace-scoped client otherwise.
+- **Per-workspace OIDC auto-refresh** (`swarmer/openshell_oidc.py`) — `WorkspaceOidcAuthManager` (module-level singleton `oidc_manager`) keeps one in-memory, lock-coordinated `OidcGatewayAuth` instance per `workspace_id`, each independently performing RFC 6749 `refresh_token` grants against its own IdP and writing refreshed/rotated tokens back to that workspace's `WorkspaceGateway` row via `asyncio.run_coroutine_threadsafe` (mirrors the single-tenant `OidcGatewayAuth` design from ACM-41655's initial global-gateway slice, but keyed and isolated per workspace instead of a single process-wide instance).
+- **Call-site threading** — `routers/sessions.py` (`_do_launch_openshell`, `_setup_openshell_sandbox`, `_run_openshell_agent`, stop/delete/policy-chunk handlers), `routers/tui_ws.py`, `routers/secrets.py` + `api/v1/secrets.py` (provider existence checks / Vertex+Gemini provider pushes), `routers/chat_proxy.py` (`_resolve_upstream`/`_openshell_httpx_kwargs`/`_openshell_ssl_context` take an optional `GatewayConfig` and inject `Authorization: Bearer` for OIDC/bearer workspaces alongside the existing mTLS cert path — `gw_config.bearer_callable()` is invoked via `asyncio.to_thread()` at both the HTTP and WebSocket proxy call sites since it is a synchronous callable that may block on an OIDC token refresh), `github_auth.start_token_refresh_loop()` (accepts `workspace_id`/`client`), and `main.py` (`_restart_server_sessions`, `_restart_github_app_iat_refresh`) all resolve and pass a workspace-scoped client/`GatewayConfig` instead of assuming the single global gateway.
+- **Scheduler GC** (`scheduler.py:_collect_orphaned_sandboxes`) — collects every distinct `GatewayConfig` referenced across workspaces (deduped by `(gateway_url, auth_mode)`, always including the default), sweeps orphan/zombie sandboxes independently per gateway, then reconciles "deleted externally" sessions against the union of all gateways' live sandbox names.
+- **Activation UX** — `/workspaces/new` and `/workspaces/{id}/edit` offer a radio choice (`Default Cluster Gateway` vs `Dedicated / Remote OpenShell Gateway`) with two entry points for the dedicated case: (1) a **paste box** that sends free-form `openshell gateway add ...` CLI commands or `metadata.json` blobs to `POST /api/v1/workspaces/gateway/parse-command` (`swarmer/openshell_command_parser.py`) and auto-fills the structured fields, and (2) direct structured fields (URL, auth mode, OIDC issuer/client/audience, refresh/bearer token). A companion **credential formatting helper** (`swarmer/openshell_token_parser.py`, exposed via `POST /api/v1/workspaces/gateway/parse-token`) normalizes pasted refresh tokens whether given as a raw string, a full `oidc_token.json` bundle, or a `KEY=VALUE` line. A live **"Test Gateway Connection"** button (`POST /api/v1/workspaces/gateway/test-connection` → `openshell_client.probe_gateway_connectivity()`) validates reachability/auth before saving. `/workspaces` list shows a `Shared`/`Dedicated` badge per workspace.
+- **REST API** (`swarmer/api/v1/workspaces.py`) — `WorkspaceCreate.gateway` (optional) sets up the gateway at creation time; `GET/POST/DELETE /api/v1/workspaces/{id}/gateway` manage it after the fact (`DELETE` reverts to the cluster default); responses use `WorkspaceGatewayOut` which reports `has_refresh_token`/`has_bearer_token`/`has_tls_key` booleans instead of ever returning the plaintext secret. The Agent Swarm MCP server (`mcp-server/`) mirrors these as `get_workspace_gateway`, `set_workspace_gateway`, `delete_workspace_gateway`, `test_workspace_gateway`, `parse_gateway_command`, and `parse_gateway_token` tools.
+- **Future work**: this abstraction is the prerequisite for auto-provisioning a **local OpenShell instance per workspace** — a provisioner would only need to write the resulting endpoint/certs into `WorkspaceGateway`; no other call site changes would be required.
 
 ### Model Preset Settings (ACM-37232)
 
@@ -245,8 +284,8 @@ Deployment; `make delete` removes it.
 | `claude_preset_plan_model` | `CLAUDE_PRESET_PLAN_MODEL` | `google-vertex-anthropic/claude-opus-4-6@default` | Claude preset's PLAN-role model |
 | `claude_preset_build_model` | `CLAUDE_PRESET_BUILD_MODEL` | `google-vertex-anthropic/claude-sonnet-5@default` | Claude preset's BUILD-role model |
 | `claude_preset_small_model` | `CLAUDE_PRESET_SMALL_MODEL` | `google-vertex-anthropic/claude-haiku-4-5@20251001` | Claude preset's small/housekeeping model |
-| `gemini_preset_plan_model` | `GEMINI_PRESET_PLAN_MODEL` | `google/gemini-3.1-pro-preview` | Gemini preset's PLAN-role model |
-| `gemini_preset_build_model` | `GEMINI_PRESET_BUILD_MODEL` | `google/gemini-3.6-flash` | Gemini preset's BUILD-role model |
+| `gemini_preset_plan_model` | `GEMINI_PRESET_PLAN_MODEL` | `google/gemini-3.7-flash` | Gemini preset's PLAN-role model |
+| `gemini_preset_build_model` | `GEMINI_PRESET_BUILD_MODEL` | `google/gemini-3.7-flash` | Gemini preset's BUILD-role model |
 | `gemini_preset_small_model` | `GEMINI_PRESET_SMALL_MODEL` | `google/gemini-3.5-flash-lite` | Gemini preset's small/housekeeping model |
 | `opencode_experimental_plan_mode` | `OPENCODE_EXPERIMENTAL_PLAN_MODE` | `true` | Enables the opencode plan agent so the PLAN-role model above is actually used |
 
@@ -259,7 +298,7 @@ Every data item Swarmer currently pushes into agent pods, its source model, the 
 
 | Category | Data | Source Model | Current K8s Mechanism | Target OpenShell API |
 |---|---|---|---|---|
-| AI Credentials | GCP Project, Vertex Location, ADC JSON, Gemini key | `OpencodeSecret` | K8s Secret → `envFrom` | Gateway `create_provider()` env injection |
+| AI Credentials | GCP Project, Vertex Location (DB); ADC JSON, Gemini key (Gateway-only, ACM-37263) | `OpencodeSecret` | Gateway provider (no K8s Secret) | `configure_google_cloud_provider()` (ADC) / `ensure_provider()` (Gemini) at credential-save time; `provider_exists()` checked at session launch |
 | Git Auth | PAT token, GitHub username | `GitHubPAT` | K8s Secret → `secretKeyRef` + init container credential store | Gateway credential injection + `clone_repos()` |
 | Git Repos | repo_url, branch, local_path (per repo) | `SessionRepo` | Init container git clone | `openshell_client.clone_repos()` |
 | MCP Tokens | Jira URL, Jira access token, Jira email | `McpServer` | K8s Secret → `envFrom` | Gateway env injection |
@@ -269,9 +308,9 @@ Every data item Swarmer currently pushes into agent pods, its source model, the 
 | Prompt | instruction_prompt + base_prompt + repo_context | `Session` + `WorkspacePrompt` | CLI arg (prompt mode) or `SWARMER_AGENT_MD` env → AGENTS.md (TUI/server) | `write_agents_md()` to `/sandbox/AGENTS.md` for **all modes**; prompt mode reads it via `$(</sandbox/AGENTS.md)` shell expansion; TUI/server agent reads it automatically |
 | Env Vars | HOME, NODE_OPTIONS, GOOGLE_APPLICATION_CREDENTIALS | Hardcoded | Pod env spec | Sandbox env vars via Gateway |
 | Extra Env | Arbitrary workspace key-value pairs | External K8s Secret | `envFrom` (`swarmer-agent-extra-env`, optional) | Gateway env injection |
-| Volumes | PVC → /workspace, ConfigMap → /tmp/agent-config-ro, ADC → /app/gcloud | N/A | Pod volume spec | Sandbox filesystem (no separate volumes) |
+| Volumes | PVC → /workspace, ConfigMap → /tmp/agent-config-ro, ADC → /app/gcloud | N/A | Pod volume spec | Sandbox filesystem — `/sandbox` is backed by an OpenShell-managed PVC (`workspace-{sandbox-name}`, sized by `server.workspaceDefaultStorageSize`), not a Swarmer-created volume; no ConfigMap/ADC volume mounts |
 | Startup Script | Config copy, safe dir, git creds, symlinks, AGENTS.md write, model write, branch checkout | N/A | `sh -c` command chain | Simplified script — removes credential setup and git clone stages |
-| Pod Config | Resources (1Gi-8Gi/500m-2000m), fsGroup, runAsUser, imagePullPolicy, restartPolicy | `Session` + `Settings` | Pod spec | Sandbox resource config — ephemeral storage set per-session via `Session.ephemeral_disk` (dropdown: `2Gi`/`5Gi`/`10Gi`, default `2Gi`), passed to `create_sandbox(ephemeral_storage=...)`. The OpenShell gateway's `workspaceDefaultStorageSize` Helm value (`OPENSHELL_WORKSPACE_STORAGE` in the Makefile, default `10Gi`) is a separate, gateway-wide ceiling for the `/sandbox` PVC — only applied on first OpenShell install |
+| Pod Config | Resources (1Gi-8Gi/500m-2000m), fsGroup, runAsUser, imagePullPolicy, restartPolicy | `Session` + `Settings` | Pod spec | Sandbox resource config — ephemeral storage hardcoded to `10Gi` for every sandbox (`openshell_client.SANDBOX_EPHEMERAL_STORAGE`, ACM-39804; no longer per-session, see ACM-38184). The OpenShell gateway's `workspaceDefaultStorageSize` Helm value (`OPENSHELL_WORKSPACE_STORAGE` in the Makefile) is a separate, gateway-wide ceiling for the `/sandbox` PVC — only applied on first OpenShell install |
 | Networking | Container port 4096 (server mode), ClusterIP Service, OpenShift Route | `Session.mode` | K8s Service/Route | OpenShell network endpoint |
 
 - **Startup script simplification** -- the OpenShell startup script removes: credential helper setup, git clone, `envFrom` secret injection, ADC volume mount. Keeps: config copy, MCP config overwrite, model JSON write, AGENTS.md write, branch checkout, agent binary invocation
@@ -347,7 +386,8 @@ Runs the agent tool's TUI binary (`tool.get_tui_binary()`) with model and resume
 
 Sessions can generate git diffs from running sandboxes:
 - Executes `git diff` (or `git diff origin/{branch}` if using a working branch) via `openshell_client.exec_command()` in the sandbox
-- AI-generated commit messages via Vertex AI Claude, Anthropic API, or Gemini API (falls back to simple file-list summary)
+- AI-generated commit messages via the Gemini API, called directly from the Swarmer process (`_llm_commit_msg_gemini`), falling back to a simple file-list summary (`_fallback_commit_msg`) when unavailable
+- Since ACM-37263, the Gemini key is stored only on the OpenShell gateway (write-only, never returned in plaintext), so this feature only works for workspaces with a legacy key still present in `OpencodeSecret.google_api_key_enc` from before the key was rotated/migrated; new or rotated keys always fall through to the file-list summary
 - Patches downloadable as `.patch` files
 
 ## UI Pattern
@@ -373,11 +413,184 @@ The session detail page (`sessions/detail.html`) uses a two-column grid inside t
 | Active (Chat) | `(Status) ∙ [■ Stop] sandbox-name [Chat ↗] · · · · · [Delete]` |
 | Active (other) | `(Status) ∙ [■ Stop] sandbox-name · · · · · · · · · · [Delete]` |
 
-Launch pills are ordered TUI → CHAT → PROMPT (most-used first). TUI and CHAT use green fill (`.launch-pill-green`); PROMPT uses a dark charcoal fill with green border (`.launch-pill-muted`). Each pill POSTs the full config form to `/launch` with `mode` and `save_config=1` — no separate save step required.
+### Pill UX Architecture
 
-**Agent tool pill** — OpenCode is currently the only supported agent tool, shown as a static, always-selected pill rendering the official block-pixel SVG logo inline at 78×14px with a rainbow gradient border. The underlying registry/strategy pattern supports adding more tools in the future without further UI changes.
+Swarmer uses branded, styled interactive pills across the UI for tool selection, execution modes, logs, and status:
 
-**Cluster capacity indicator** — a single pill labelled `Sessions: X / Y active` with optional `· N queued` appended. Colour escalates: outline (0 active) → green (healthy) → gold (near/at capacity: `active >= max-1` for `max > 2`, `active == max` for `max ≤ 2`) → red (any queued). Rendered in both `detail.html` and `_list_rows.html`.
+- **Agent Tool Pills** (`.agent-pill`, `.agent-pill-oc`, `.agent-pill-shell`):
+  - Branded button pills used on both the New Session form (`new.html`) and the Configuration card (`detail.html`).
+  - **OpenCode**: Official 4×5 block-pixel SVG wordmark (`78×14px`), dark background (`#2d2d2d`) when inactive, and a 6-stop rainbow gradient border (`linear-gradient(135deg, #e06c75, #e5c07b, #98c379, #56b6c2, #61afef, #c678dd)`) on `#1e1e1e` when selected.
+  - **Shell**: Matching 4×5 block-pixel `>_ SHeLL` SVG wordmark (`66×14px`) in phosphor matrix green (`#38ef7d`) with cyan prompt glyph (`#58a6ff`), and an emerald-to-cyan terminal gradient border (`linear-gradient(135deg, #38ef7d, #11998e, #00f2fe, #4facfe)`) on `#0d130e` when selected.
+  - **Interaction**: Clicking a pill updates the underlying hidden input (`agent_tool`), toggles AI provider selector visibility (hidden for Shell), updates helper text dynamically, and triggers auto-save (`_cfgSave()`) on the detail page. In `server` mode, the Shell pill is automatically disabled (`cursor: not-allowed`, `opacity: 0.5`).
+
+- **Launch Pills** (`.launch-pill-green`, `.launch-pill-muted`):
+  - Action bar launch buttons ordered `TERM.UI` → `CHAT` → `PROMPT` (most-used first).
+  - `TERM.UI` and `CHAT` use green fill (`.launch-pill-green`); `PROMPT` uses a dark charcoal fill with green border (`.launch-pill-muted`).
+  - Submitting any launch pill POSTs the full configuration form to `/launch` with `mode` and `save_config=1` atomically.
+
+- **Log-View Toggle Pills** (`.log-pill`):
+  - Used on the Output tab and History expandable rows to toggle between processed Output and raw console logs.
+  - Selected state applies the signature rainbow gradient border on `#1e1e1e`.
+
+- **Cluster Capacity Indicator Pill**:
+  - A status pill labelled `Sessions: X / Y active` with optional `· N queued` appended.
+  - Color escalates dynamically: outline (0 active) → green (healthy) → gold (near/at capacity: `active >= max-1` for `max > 2`, `active == max` for `max ≤ 2`) → red (any queued). Rendered in both `detail.html` and `_list_rows.html`.
+
+- **History Source Pills**:
+  - Denormalized source pills in Run History rows: purple schedule pills for cron runs (`[📅 schedule-name · prompt-name]`), gold event pills for event-driven runs (`[⚡ Event: PR #104 (event-condition)]`), green `[TERM.UI]` / `[CHAT]` pills for interactive runs, and prompt name pills for manual prompt runs.
+
+## Event-Driven PR Events Watcher & Session Dispatcher
+
+The **Swarm PR Events Watcher** (`swarmer/pr_watcher.py`) is an in-process, firewall-safe asynchronous background loop that runs inside the Swarmer pod's FastAPI lifespan, alongside `scheduler.py`. It monitors GitHub repositories for Pull Request state changes and dispatches Swarm sessions only when actionable work is needed from trusted contributors.
+
+There is **no standalone CLI or static JSON configuration** — all triggers, repositories, conditions, and author scopes are discovered directly from `swarmer.db` (configured entirely via the Web UI's Scheduling section). Dispatches happen in-process via `_do_launch()`, inheriting capacity limiting and `MAX_CONCURRENT_AGENTS` queueing automatically.
+
+```text
+GitHub Events API (Outbound ETag Polling)
+                 │
+  ┌──────────────┴──────────────┐
+  ▼                             ▼
+304 Not Modified              200 OK (New Events Detected)
+(0 rate-limit cost)             │
+                                ▼
+                       Scan Open PRs for Repo
+                                │
+                                ▼
+               ┌────────────────────────────────┐
+               │    Author & Trust Filtering    │
+               │  - Resolve author scope        │
+               │  - Enforce 3-layer trust model │
+               └────────────────┬───────────────┘
+                                │
+                                ▼
+               ┌────────────────────────────────┐
+               │  CI Completion & Debounce Bar  │
+               │  - 0 IN_PROGRESS / QUEUED      │
+               │  - 90–120s quiet period        │
+               └────────────────┬───────────────┘
+                                │
+                                ▼
+               ┌────────────────────────────────┐
+               │   Circuit Breaker & Dedup DB   │
+               │  - SQLite (repo, pr, sha, act) │
+               │  - Max 3 attempts per SHA      │
+               └────────────────┬───────────────┘
+                                │
+                                ▼
+                    Dispatch Swarm Session
+               (In-Process via _do_launch())
+```
+
+### 1. Fast Path vs. Slow Path Architecture
+
+- **Fast Path (Event-Driven Polling):** Polls `GET https://api.github.com/repos/{owner}/{repo}/events` with `If-None-Match: <etag>`. When no activity occurred, GitHub returns `304 Not Modified` consuming **0 rate-limit cost**. On `200 OK`, the daemon wakes up and scans open PRs for that repo.
+- **Slow Path (Hybrid Safety Net):** Runs a full periodic sweep every 30–60 minutes across event-scoped repos to catch untracked backend state transitions such as merge conflicts (`mergeable: dirty` generates no GitHub event stream payload).
+
+### 2. Scoped Watched-Repo Resolution
+
+To minimize API consumption and avoid unnecessary network calls:
+- **Rule:** The watcher **only polls repositories that have at least one enabled `event` trigger**.
+- Repositories configured with cron schedules (e.g. daily CVE audits or weekly package updates) are handled in-process by Swarmer's internal `swarmer/scheduler.py` loop and are **never polled** by the watcher daemon.
+- The watched-repo set is dynamically refreshed on an interval; stale ETags are purged when a repository is removed.
+
+### 3. Author Routing Taxonomy & "My PRs" Resolution
+
+Each trigger defines an **Author Scope**, an **Event Condition**, and a required
+**Prompt**. The watcher evaluates the event condition first, then applies the
+author scope. The selected Prompt determines what the agent does after a match.
+
+| Author Scope | Who Matches | Behavior |
+|---|---|---|---|
+| **`My PRs` (`self`)** | Configured `fix_authors` (comma-separated logins in schedule) | Matches only those author logins. |
+| **`Team PRs` (`team`)** | Trusted collaborators (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, or on allowlist) | Matches trusted non-bot authors. |
+| **`Bot PRs` (`bots`)** | Automated bot logins (`dependabot[bot]`, `renovate[bot]`, `cve-*`, `app/*`) | Matches recognized bot authors. |
+| **`All PRs` (`all`)** | Any PR author | Does not apply an author restriction. |
+
+Supported event conditions are **CI Failure or Merge Conflict**, **New PR or
+New Commits** (once per head SHA), **Review Comments**, and **Any Actionable PR State**. A fork PR
+is still eligible; the event context includes `fork_no_push` when the base
+repository cannot push to the fork branch.
+
+### 4. 3-Layer Team-PR Trust Model & Security Guardrails
+
+To prevent arbitrary code execution, compute/token exhaustion, and prompt injection attacks from untrusted external contributors:
+
+1. **Layer 1: Native GitHub Author Association (Default)**
+    - Automatically trusts team-scope PR authors with `OWNER`, `MEMBER`, `COLLABORATOR`, or `CONTRIBUTOR` associations.
+   - Treats first-time and unknown associations (`FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `MANNEQUIN`, `NONE`) as **untrusted** by default.
+2. **Layer 2: Workspace Trust Policy**
+   - Configurable explicit allowlist of logins or GitHub organization team memberships (`GET /orgs/{org}/teams/{slug}/members`).
+3. **Layer 3: The `ok-to-review` Label Gate**
+   - Untrusted external PRs remain ignored until a repository collaborator applies the `ok-to-review` label (Kubernetes/Prow convention).
+   - **RBAC Protected:** Applying labels on GitHub requires Triage, Write, or Admin permissions on the base repository; external fork authors cannot self-apply this label. When label timeline events are available, the watcher verifies the label applier's identity and falls back to base repository RBAC when timeline data is unavailable.
+   - **Invalidation:** New commits pushed to an external PR automatically invalidate prior approval and require re-evaluation.
+
+### 5. Resilience, Circuit Breaker & Concurrency
+
+- **CI Completion Barrier & Debounce:** Check runs must show 0 `IN_PROGRESS` or `QUEUED` checks, plus a 90–120s quiet-period debounce before dispatching a matching schedule.
+- **Circuit Breaker:** Maximum 3 attempts per `(event condition, head_sha)`. If the agent fails after 3 attempts, the status is marked `blocked`. A new human commit to the branch resets the counter.
+- **Dispatch Deduplication & Loop Prevention:** Dispatches are keyed by `(repo, PR, head_sha, condition, session_id)` so each commit SHA is processed at most once per trigger condition and session, bounded by the 3-attempt circuit breaker across all scopes (`self`, `team`, `bots`, `all`) to prevent recursive loops.
+- **Capacity Back-pressure:** Dispatches automatically inherit Swarmer's `MAX_CONCURRENT_AGENTS` queueing.
+
+### 6. UI & Observability
+
+- **Trigger Type Selector:** Available in both Add Schedule and inline Edit forms (`_schedule_items.html`), supporting live conversion between Cron and Event triggers.
+- **Visual Pills:** Gold `⚡ Event: <label>` pills render in the Session List, Status Badges, and Run History table.
+- **Drawer Context Logging:** Expanding a run record in Run History displays full triggering metadata (`repo`, `PR #`, `head_sha`, `event_condition`, `title`).
+- **Event Help Popover:** The Scheduling card explains condition matching, author scopes, and how the selected Prompt controls the run.
+
+---
+
+## Debugging & Log Retrieval Reference
+
+When diagnosing system behavior, Swarmer provides multiple layers of logs and state observability:
+
+### 1. Swarmer Server & In-Process Watcher Logs
+- **In-Cluster Pod Logs:**
+  ```sh
+  kubectl logs -n swarmer -l app=swarmer -f --tail=200
+  ```
+- **Log Level Adjustment:** Set `LOG_LEVEL=DEBUG` in `swarmer-extra-env` or `.env` to enable verbose logging for `swarmer.pr_watcher`, `swarmer.scheduler`, `swarmer.openshell_client`, and `swarmer.routers.sessions`.
+- **Local Dev Server:** Look at terminal stdout where `make dev` is running.
+
+### 2. Agent Execution Outputs (Processed vs. Raw Logs)
+- **Web UI:**
+  - On the **Output Tab** of any session: use the toggle button (`[Output] | [Raw Log]`) to switch between the clean assistant response and the raw ANSI console log.
+  - On the **History Tab**: click the expand chevron on any past run to open the execution drawer. Use the `[Output]` and `[Raw Log]` pills to view logs from that specific run.
+- **REST API:**
+  ```sh
+  # Get latest run output (clean + raw)
+  curl -s -H "Authorization: Bearer $TOKEN" "$SWARMER_URL/api/v1/workspaces/$WS_ID/sessions/$SID/output"
+  
+  # List all historical runs with metadata
+  curl -s -H "Authorization: Bearer $TOKEN" "$SWARMER_URL/api/v1/workspaces/$WS_ID/sessions/$SID/runs"
+  ```
+
+### 3. Watcher State & Circuit Breaker Inspection
+All watcher dispatch history, attempt counters, and cached ETags are stored in the SQLite database (`$SWARMER_DB_PATH`):
+```sh
+# Inspect circuit breaker and dispatch status
+sqlite3 "$SWARMER_DB_PATH" "SELECT repo, pr_number, head_sha, action, status, attempts, last_dispatched_at, last_error FROM pr_action_state ORDER BY updated_at DESC LIMIT 20;"
+
+# Inspect cached GitHub Events ETags
+sqlite3 "$SWARMER_DB_PATH" "SELECT repo, etag, last_checked_at FROM repo_etags;"
+```
+
+### 4. OpenShell Sandbox & Gateway Logs
+- **Gateway Logs (Credential Injection & Proxy Routing):**
+  ```sh
+  kubectl logs -n openshell -l app.kubernetes.io/component=gateway -f --tail=100
+  ```
+- **Supervisor Logs (Sandbox Lifecycle & gRPC Exec):**
+  ```sh
+  kubectl logs -n openshell -l app.kubernetes.io/component=supervisor -f --tail=100
+  ```
+- **Active Sandbox Pod Logs (Raw container logs):**
+  ```sh
+  # Find sandbox pod
+  kubectl get pods -n openshell-sandboxes
+  kubectl logs -n openshell-sandboxes <sandbox-pod-name> -f
+  ```
 
 ## Adding New Features
 
@@ -511,3 +724,54 @@ path OPA reports.
 
 **Reference implementation:** `scripts/openshell_jira_smoke_test.py` + `_JIRA_MCP_BLOCK`
 in `swarmer/openshell_policy.py` — worked through the full sub-bump loop to reach 18/18.
+
+## Agent Swarm MCP Server (`mcp-server/`)
+
+The standalone Agent Swarm MCP Server (`agent-swarm-mcp-server`) exposes Swarmer's full REST API (`/api/v1/`) as Model Context Protocol tools for AI agent orchestration. This enables developer-agent interfaces (OpenCode, Claude Code) or agent-in-sandbox workloads to launch, monitor, configure, and orchestrate other Swarmer sessions programmatically.
+
+### Architecture & Data Flow
+
+```text
+AI Coding Agent (OpenCode / Claude Code)
+         │
+         ▼  (stdio / SSE MCP transport)
+Agent Swarm MCP Server (`mcp-server/`)
+  ├── FastMCP Server (`agent_swarm_mcp_server/server.py`)
+  ├── API Client (`agent_swarm_mcp_server/client.py`)
+  └── Auth Token Resolver (`agent_swarm_mcp_server/auth.py`)
+         │
+         ▼  (HTTPS Bearer Token Authorization)
+Swarmer REST API (`/api/v1/`)
+  ├── Workspaces & ACL Memberships
+  ├── Global Admin & User Identity (/me)
+  ├── Agent Sessions (Launch / Stop / Monitor / History)
+  └── Prompts, Repositories, PATs, & Schedules
+```
+
+### Available Tool Capabilities
+
+| Domain | MCP Tools | Description |
+|---|---|---|
+| **Workspaces & ACL** | `list_workspaces`, `get_workspace`, `create_workspace`, `update_workspace`, `delete_workspace`, `list_workspace_members`, `add_workspace_member`, `remove_workspace_member` | Full workspace CRUD and explicit member access management (ACM-41659 database ACL). |
+| **Identity & Admins** | `get_me`, `list_known_users`, `list_admins`, `add_admin`, `remove_admin`, `bootstrap_admin` | Query authenticated caller identity and permissions; manage global Swarmer admins. |
+| **Session Lifecycle** | `list_sessions`, `find_sessions_by_repo`, `get_session`, `create_session`, `update_session`, `delete_session`, `launch_session`, `stop_session`, `get_session_status`, `get_session_output`, `wait_for_session` | Launch, stop, monitor, and await agent execution runs across OpenCode and Shell tools. |
+| **Repos & Prompts** | `add_repo_to_session`, `remove_repo_from_session`, `list_workspace_prompts`, `set_session_prompt`, `list_github_pats` | Attach git repositories and configure prompts or private git PAT credentials. |
+| **Schedules** | `list_session_schedules`, `add_session_schedule`, `update_session_schedule`, `delete_session_schedule` | Manage automated cron schedules and schedule-specific prompt overrides. |
+
+### Authentication & Token Resolution
+
+The MCP server resolves Kubernetes bearer tokens in `agent_swarm_mcp_server/auth.py` in priority order:
+
+1. **`AGENT_SWARM_API_TOKEN`** env var (explicit token override; always wins).
+2. **In-cluster ServiceAccount token** at `/var/run/secrets/kubernetes.io/serviceaccount/token` (used when deployed as a sidecar or in-pod agent).
+3. **Kubeconfig Context** (`$KUBECONFIG` or default kubeconfig file):
+   - Direct `token` field on current user.
+   - Exec credential provider output (common with `oc login` and cloud IAM providers).
+   - Validated against Swarmer's `/api/v1/` endpoints with fallback resolution for OpenShift OAuth tokens.
+
+### Setup & CLI Automation
+
+- **Web UI (`/token`):** Authenticated users can visit `/token` directly from the masthead navigation to view their active token, API endpoint URL, and a ready-to-copy `opencode.json` configuration block.
+- **CLI Automation (`make mcp-setup` / `make api-info`):**
+  - `make mcp-setup`: Configures the local `opencode.json` file in the project with the detected Swarmer route and token.
+  - `make api-info`: Prints current API endpoint, decoded user identity, and the MCP JSON snippet.

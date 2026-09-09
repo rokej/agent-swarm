@@ -66,6 +66,9 @@ async def migrate_db() -> None:
         "ALTER TABLE sessions ADD COLUMN agent_tool VARCHAR(32) NOT NULL DEFAULT 'opencode'",
         "ALTER TABLE opencode_secrets ADD COLUMN anthropic_api_key_enc TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE opencode_secrets ADD COLUMN openai_api_key_enc TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE opencode_secrets ADD COLUMN gemini_configured BOOLEAN NOT NULL DEFAULT 0",
+        "ALTER TABLE opencode_secrets ADD COLUMN openai_configured BOOLEAN NOT NULL DEFAULT 0",
+        "ALTER TABLE opencode_secrets ADD COLUMN vertex_configured BOOLEAN NOT NULL DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN status_detail VARCHAR(255) NOT NULL DEFAULT ''",
         "ALTER TABLE sessions ADD COLUMN run_started_at DATETIME",
         "ALTER TABLE sessions ADD COLUMN run_completed_at DATETIME",
@@ -158,16 +161,159 @@ async def migrate_db() -> None:
         # ACM-37190: CRUSH agent tool removed (ACM-37174) — normalize any existing
         # sessions still carrying the retired 'crush' value so registry lookups
         # (get_tool) don't raise ValueError when rendering session list/detail pages.
-        "UPDATE sessions SET agent_tool = 'opencode' WHERE agent_tool != 'opencode'",
+        # 'shell' is an additional supported tool and must NOT be normalised to 'opencode'.
+        "UPDATE sessions SET agent_tool = 'opencode' WHERE agent_tool NOT IN ('opencode', 'shell')",
         # ACM-37232 follow-up: Session.model renamed to Session.provider — the
-        # column now stores an AI provider selection ("claude"/"gemini" preset)
+        # column now stores an AI provider selection ("claude"/"gemini"/"openai" preset)
         # rather than a specific model ID. "no such column" (fresh DB already
         # created with "provider", or already migrated) is safely suppressed.
         "ALTER TABLE sessions RENAME COLUMN model TO provider",
         # ACM-38184: per-session ephemeral disk size, replacing the global
-        # SANDBOX_EPHEMERAL_STORAGE env var. Default matches OpenShell's own
-        # built-in default (2Gi) so existing sessions are a no-op until edited.
+        # SANDBOX_EPHEMERAL_STORAGE env var. Vestigial as of ACM-39804 — the
+        # per-session UI/API was removed (it only bounded the pod's ephemeral-storage
+        # compute resource, not the `/sandbox` PVC users actually cared about).
+        # Migration kept so existing DBs don't break; column is no longer read.
         "ALTER TABLE sessions ADD COLUMN ephemeral_disk VARCHAR(32) NOT NULL DEFAULT '2Gi'",
+        # ACM-39876: snapshot what triggered each run (schedule/prompt/mode) so
+        # Run History can show a source pill even after the schedule/prompt
+        # is later edited or deleted.
+        "ALTER TABLE session_runs ADD COLUMN schedule_label VARCHAR(255) NOT NULL DEFAULT ''",
+        "ALTER TABLE session_runs ADD COLUMN prompt_name VARCHAR(255) NOT NULL DEFAULT ''",
+        "ALTER TABLE session_runs ADD COLUMN mode VARCHAR(16) NOT NULL DEFAULT 'prompt'",
+        # ACM-41659: database-backed workspace access control replaces
+        # per-workspace K8s namespace + RoleBinding RBAC now that OpenShell
+        # owns sandbox lifecycle. owner_id is best-effort backfilled to the
+        # first workspace_member (if any) so pre-existing workspaces aren't
+        # left ownerless; otherwise falls back to the configured workspace
+        # admin allow-list at access-check time.
+        "ALTER TABLE workspaces ADD COLUMN owner_id VARCHAR(255) NOT NULL DEFAULT ''",
+        """CREATE TABLE IF NOT EXISTS workspace_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL,
+            role VARCHAR(32) NOT NULL DEFAULT 'member',
+            created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+            UNIQUE(workspace_id, user_id)
+        )""",
+        # ACM-41659 follow-up: zero-touch migration so nobody has to be
+        # manually re-added to a workspace they already had access to.
+        # Backfill workspace_members from every existing per-user table that
+        # already records (workspace_id, user_id) — the pre-existing "shared
+        # credential" ownership pattern is the best available signal for who
+        # was actively using each workspace. INSERT OR IGNORE relies on the
+        # UNIQUE(workspace_id, user_id) constraint above for idempotence.
+        """INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role)
+           SELECT DISTINCT workspace_id, user_id, 'member'
+           FROM opencode_secrets WHERE user_id != ''""",
+        """INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role)
+           SELECT DISTINCT workspace_id, user_id, 'member'
+           FROM github_pats WHERE user_id != ''""",
+        """INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role)
+           SELECT DISTINCT workspace_id, user_id, 'member'
+           FROM mcp_servers WHERE user_id != ''""",
+        """INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role)
+           SELECT DISTINCT workspace_id, user_id, 'member'
+           FROM github_apps WHERE user_id != ''""",
+        # Backfill Workspace.owner_id (when still empty) from the earliest
+        # known user of that workspace across the same four tables, so every
+        # migrated workspace with prior activity keeps someone able to
+        # rename/delete it and manage its members. Workspaces with no prior
+        # per-user records at all fall through to the workspace_acl.py
+        # "claim on write" fallback (open to any authenticated user until
+        # someone performs the first management action on it).
+        """UPDATE workspaces SET owner_id = (
+             SELECT u.user_id FROM (
+                 SELECT workspace_id, user_id, created_at FROM opencode_secrets WHERE user_id != ''
+                 UNION ALL
+                 SELECT workspace_id, user_id, created_at FROM github_pats WHERE user_id != ''
+                 UNION ALL
+                 SELECT workspace_id, user_id, created_at FROM mcp_servers WHERE user_id != ''
+                 UNION ALL
+                 SELECT workspace_id, user_id, created_at FROM github_apps WHERE user_id != ''
+             ) u
+             WHERE u.workspace_id = workspaces.id
+             ORDER BY u.created_at ASC
+             LIMIT 1
+           )
+           WHERE workspaces.owner_id = ''
+             AND EXISTS (
+                 SELECT 1 FROM (
+                     SELECT workspace_id, user_id FROM opencode_secrets WHERE user_id != ''
+                     UNION ALL
+                     SELECT workspace_id, user_id FROM github_pats WHERE user_id != ''
+                     UNION ALL
+                     SELECT workspace_id, user_id FROM mcp_servers WHERE user_id != ''
+                     UNION ALL
+                     SELECT workspace_id, user_id FROM github_apps WHERE user_id != ''
+                 ) u2 WHERE u2.workspace_id = workspaces.id
+             )""",
+        # ACM-41659 follow-up: self-service global admins (supplements the
+        # static WORKSPACE_ADMIN_USERS/WORKSPACE_ADMIN_GROUPS env vars).
+        """CREATE TABLE IF NOT EXISTS global_admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL UNIQUE,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+        )""",
+        # ACM-41655: Dedicated OpenShell gateway per workspace.
+        """CREATE TABLE IF NOT EXISTS workspace_gateways (
+            workspace_id INTEGER PRIMARY KEY,
+            gateway_url VARCHAR(1024) NOT NULL,
+            auth_mode VARCHAR(32) NOT NULL DEFAULT 'oidc',
+            oidc_issuer VARCHAR(1024),
+            oidc_client_id VARCHAR(255),
+            oidc_audience VARCHAR(255),
+            refresh_token_enc TEXT,
+            access_token_enc TEXT,
+            access_token_expires_at DATETIME,
+            bearer_token_enc TEXT,
+            tls_ca TEXT,
+            tls_cert TEXT,
+            tls_key_enc TEXT,
+            tls_verify BOOLEAN NOT NULL DEFAULT 1,
+            created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+            updated_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+            FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+        )""",
+        # ACM-42674: Event-driven trigger configuration and event context in run history
+        "ALTER TABLE session_schedules ADD COLUMN trigger_type VARCHAR(32) NOT NULL DEFAULT 'cron'",
+        "ALTER TABLE session_schedules ADD COLUMN event_condition VARCHAR(64) NOT NULL DEFAULT ''",
+        "ALTER TABLE session_schedules ADD COLUMN author_scope VARCHAR(32) NOT NULL DEFAULT 'all'",
+        "ALTER TABLE session_schedules ADD COLUMN fix_authors VARCHAR(512) NOT NULL DEFAULT ''",
+        "ALTER TABLE session_schedules ADD COLUMN include_event_context BOOLEAN NOT NULL DEFAULT 1",
+        "ALTER TABLE session_schedules ADD COLUMN provider VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE session_runs ADD COLUMN trigger_type VARCHAR(32) NOT NULL DEFAULT 'manual'",
+        "ALTER TABLE session_runs ADD COLUMN event_context TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE sessions ADD COLUMN event_context TEXT NOT NULL DEFAULT ''",
+        # ACM-42674 follow-up: in-process PR watcher state & ETag caching
+        """CREATE TABLE IF NOT EXISTS pr_action_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo VARCHAR(255) NOT NULL,
+            pr_number INTEGER NOT NULL,
+            head_sha VARCHAR(64) NOT NULL,
+            action VARCHAR(32) NOT NULL,
+            session_id INTEGER,
+            status VARCHAR(32) NOT NULL DEFAULT 'dispatched',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            last_dispatched_at DATETIME,
+            created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+            updated_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+        )""",
+        # ACM-43054: pr_action_state dispatch key includes session_id for multi-session fan-out
+        "ALTER TABLE pr_action_state ADD COLUMN session_id INTEGER DEFAULT NULL",
+        "DROP INDEX IF EXISTS uq_pr_action_state_key",
+        """CREATE UNIQUE INDEX IF NOT EXISTS uq_pr_action_state_key
+           ON pr_action_state (repo, pr_number, head_sha, action, session_id)""",
+        # ACM-42978: queued PR watcher dispatches need serialized event context
+        # so same-session fan-out can run reliably after the active session ends.
+        "ALTER TABLE pr_action_state ADD COLUMN event_context TEXT NOT NULL DEFAULT ''",
+        """CREATE TABLE IF NOT EXISTS repo_etags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo VARCHAR(255) NOT NULL UNIQUE,
+            etag VARCHAR(255) NOT NULL DEFAULT '',
+            last_checked_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+        )""",
     ]
     async with _engine.begin() as conn:
         for stmt in migrations:
@@ -175,7 +321,17 @@ async def migrate_db() -> None:
                 await conn.execute(text(stmt))
             except Exception as e:
                 msg = str(e).lower()
-                if "duplicate column" in msg or "already exists" in msg or "no such column" in msg:
+                if "duplicate column" in msg or "already exists" in msg:
+                    continue
+                # "no such column" only indicates safe idempotence for legacy
+                # DROP/RENAME COLUMN statements (already-dropped or
+                # already-renamed column on a re-run) — scoped to those
+                # statements so an ADD COLUMN/CREATE TABLE failure that
+                # happens to mention "no such column" (e.g. a bad column
+                # reference elsewhere in the statement) is never swallowed.
+                stmt_upper = stmt.upper()
+                is_legacy_drop_or_rename = "DROP COLUMN" in stmt_upper or "RENAME COLUMN" in stmt_upper
+                if is_legacy_drop_or_rename and "no such column" in msg:
                     continue
                 log.error("Migration failed for %r: %s", stmt, e)
                 raise

@@ -29,6 +29,8 @@ LOCAL_PORT      ?= 8080
 OS_LOCAL_PORT   ?= 17671
 
 # User token duration
+TOKEN_DURATION ?= 8h
+
 # agent-containers build defaults (registry + image tag — checked in)
 AC_DEFAULTS ?= .push-defaults
 
@@ -42,20 +44,21 @@ AGENT_SANDBOX_VERSION    ?= v0.4.6
 OPENSHELL_NAMESPACE      ?= openshell
 OPENSHELL_TLS_DIR        ?= auth/openshell
 # Default size of the workspace PVC (backing each sandbox's /sandbox mount) at the
-# OpenShell gateway level. Per-session ephemeral disk selection (ACM-38184) only
-# controls the sandbox pod's ephemeral-storage COMPUTE resource, not this PVC — so
-# this is set to the largest per-session dropdown option (2Gi/5Gi/10Gi) as a ceiling
-# that comfortably fits any session. Override with OPENSHELL_WORKSPACE_STORAGE=<val>
-# if needed; only applied on first OpenShell install (see the deploy target).
+# OpenShell gateway level. Distinct from the sandbox pod's ephemeral-storage COMPUTE
+# resource, which is hardcoded to 10Gi in openshell_client.create_sandbox() (ACM-39804)
+# and not configurable via this variable. Override with OPENSHELL_WORKSPACE_STORAGE=<val>
+# if needed. `make deploy` applies this on every run — first install (--install) or
+# in-place upgrade (--reuse-values) — via helm; only newly created sandbox PVCs pick
+# up a changed value.
 OPENSHELL_WORKSPACE_STORAGE ?= 10Gi
 
 # ──────────────────────────────────────────────────────────────
 #  Phony targets
 # ──────────────────────────────────────────────────────────────
-.PHONY: setup-secret user-token grant-workspace grant-workspace-access grant-workspace-create \
+.PHONY: setup-secret user-token api-info mcp-setup grant-workspace grant-workspace-access grant-workspace-create \
         dev lint test smoke-test-jira \
         sync-images image-build image-push \
-        deploy delete connect openshell-register connect-openshell status \
+        deploy delete connect mcp-setup mcp-api mcp-url api-url openshell-register connect-openshell status \
         kind-deploy kind-delete \
         help
 
@@ -100,7 +103,19 @@ user-token:  ## Issue a login token for a K8s user  (SA_USER=alice, TOKEN_DURATI
 	@kubectl create token $(SA_USER) -n $(NAMESPACE) --duration=$(TOKEN_DURATION)
 	@echo "──────────────────────────────────────────────────"
 	@echo "Paste this token into the Swarmer login page."
-	@echo "Grant workspace access with: make grant-workspace-access SA_USER=$(SA_USER) WORKSPACE_NS=<ns>"
+	@echo "'$(SA_USER)' logs in as: system:serviceaccount:$(NAMESPACE):$(SA_USER)"
+	@echo "Grant workspace access via the UI: workspace -> Members tab -> Add Member -> that username"
+	@echo "(or POST /api/v1/workspaces/<id>/members {\"user_id\": \"system:serviceaccount:$(NAMESPACE):$(SA_USER)\"})"
+
+api-info: export _NAMESPACE := $(value NAMESPACE)
+api-info:  ## Display Swarmer API URL, current user token, and opencode.json snippet
+	@python3 scripts/mcp_setup.py --print-only --namespace "$${_NAMESPACE:-swarmer}"
+
+mcp-setup: export _TOKEN := $(value TOKEN)
+mcp-setup: export _URL := $(value URL)
+mcp-setup: export _NAMESPACE := $(value NAMESPACE)
+mcp-setup:  ## Configure opencode.json for Agent Swarm  (TOKEN=..., URL=...)
+	@AGENT_SWARM_API_TOKEN="$${_TOKEN:-$$AGENT_SWARM_API_TOKEN}" AGENT_SWARM_API_URL="$${_URL:-$$AGENT_SWARM_API_URL}" python3 scripts/mcp_setup.py --namespace "$${_NAMESPACE:-swarmer}"
 
 # SA_USER/OIDC_USER/WORKSPACE_NS/NAMESPACE are carried as exported shell env
 # vars (not textually substituted into the recipe) and validated against a
@@ -154,7 +169,10 @@ grant-workspace-access: export _SA_USER := $(value SA_USER)
 grant-workspace-access: export _OIDC_USER := $(value OIDC_USER)
 grant-workspace-access: export _WORKSPACE_NS := $(value WORKSPACE_NS)
 grant-workspace-access: export _NAMESPACE := $(value NAMESPACE)
-grant-workspace-access:  ## Grant a user access to a specific workspace namespace  (SA_USER=alice OR OIDC_USER=alice, WORKSPACE_NS=my-project)
+grant-workspace-access:  # [Legacy/optional, hidden from `make help`] K8s namespace RoleBinding — workspace access is now DB-backed, see README.md Access Control (SA_USER=alice OR OIDC_USER=alice, WORKSPACE_NS=my-project)
+	@echo "NOTE: Swarmer workspace access is a database ACL (ACM-41659) and no longer reads this"
+	@echo "K8s RoleBinding for authorization. Use the Members tab (or POST /api/v1/workspaces/{id}/members)"
+	@echo "to grant access instead — see README.md Access Control. Proceeding anyway..."
 	@test -n "$$_SA_USER$$_OIDC_USER" || (echo "Usage: make grant-workspace-access SA_USER=<name> WORKSPACE_NS=<ns>  (or OIDC_USER=<name> for OpenShift/OIDC users)" && exit 1)
 	@test -z "$$_SA_USER" -o -z "$$_OIDC_USER" || (echo "Error: specify only one of SA_USER or OIDC_USER, not both" && exit 1)
 	@test -n "$$_WORKSPACE_NS" || (echo "Usage: make grant-workspace-access SA_USER=<name>|OIDC_USER=<name> WORKSPACE_NS=<ns>" && exit 1)
@@ -184,7 +202,11 @@ grant-workspace-access:  ## Grant a user access to a specific workspace namespac
 grant-workspace-create: export _SA_USER := $(value SA_USER)
 grant-workspace-create: export _OIDC_USER := $(value OIDC_USER)
 grant-workspace-create: export _NAMESPACE := $(value NAMESPACE)
-grant-workspace-create:  ## Allow a user to create new workspaces  (SA_USER=alice OR OIDC_USER=alice)
+grant-workspace-create:  # [Legacy/optional, hidden from `make help`] K8s ClusterRoleBinding — set WORKSPACE_CREATE_POLICY instead, see README.md Access Control (SA_USER=alice OR OIDC_USER=alice)
+	@echo "NOTE: Swarmer workspace creation is now controlled by SWARMER_WORKSPACE_CREATE_POLICY"
+	@echo "(default 'all' — any authenticated user can create a workspace) and"
+	@echo "SWARMER_WORKSPACE_ADMIN_USERS/GROUPS — this K8s ClusterRoleBinding is no longer read."
+	@echo "See README.md Access Control. Proceeding anyway..."
 	@test -n "$$_SA_USER$$_OIDC_USER" || (echo "Usage: make grant-workspace-create SA_USER=<name>  (or OIDC_USER=<name> for OpenShift/OIDC users)" && exit 1)
 	@test -z "$$_SA_USER" -o -z "$$_OIDC_USER" || (echo "Error: specify only one of SA_USER or OIDC_USER, not both" && exit 1)
 	@case "$$_SA_USER$$_OIDC_USER" in \
@@ -223,7 +245,7 @@ lint:  ## Run ruff linter
 
 test:  ## Run unit tests (excludes Playwright browser tests)
 	python3 -m pytest tests/ -q --ignore=tests/test_ui_patternfly.py
-	python3 -m pip install -q -e "mcp-server[dev]"
+	python3 -m pip install -q --break-system-packages -e "mcp-server[dev]" 2>/dev/null || python3 -m pip install -q -e "mcp-server[dev]"
 	python3 -m pytest mcp-server/tests/ -q --rootdir=mcp-server
 
 smoke-test-jira:  ## Run Jira MCP OpenShell e2e smoke test (requires running OpenShell gateway)
@@ -316,11 +338,18 @@ deploy:  ## Deploy swarmer to the current kubectl context  (SILENT=1 for non-int
 	    --wait --timeout 5m; \
 	  echo "✓ OpenShell $(OPENSHELL_VERSION) installed (workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE))."; \
 	else \
-	  echo "OpenShell already installed — version and workspaceDefaultStorageSize changes are"; \
-	  echo "  NOT applied automatically. To upgrade in place, run:"; \
-	  echo "  helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version $(OPENSHELL_VERSION) \\"; \
-	  echo "    -n $(OPENSHELL_NAMESPACE) --set server.auth.allowUnauthenticatedUsers=true \\"; \
-	  echo "    --set server.workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE) --wait"; \
+	  echo "OpenShell already installed — applying workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE) \
+and pinned version $(OPENSHELL_VERSION) (reusing other existing values)..."; \
+	  DOCKER_CONFIG=$$(mktemp -d) helm upgrade openshell \
+	    oci://ghcr.io/nvidia/openshell/helm-chart \
+	    --version $(OPENSHELL_VERSION) \
+	    --namespace $(OPENSHELL_NAMESPACE) \
+	    --reuse-values \
+	    --set server.auth.allowUnauthenticatedUsers=true \
+	    --set server.workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE) \
+	    --wait --timeout 5m; \
+	  echo "✓ OpenShell upgraded (version=$(OPENSHELL_VERSION), workspaceDefaultStorageSize=$(OPENSHELL_WORKSPACE_STORAGE))."; \
+	  echo "  NOTE: only newly created sandboxes get the new /sandbox PVC size; existing sandboxes are unaffected."; \
 	fi; \
 	# Grant OpenShift SCCs required for sandbox pods (no-op on plain k8s / if oc is absent) \
 	if command -v oc > /dev/null 2>&1; then \
@@ -483,6 +512,98 @@ connect:  ## Port-forward the swarmer dashboard to localhost:$(LOCAL_PORT)
 	@echo "Forwarding http://localhost:$(LOCAL_PORT) → swarmer service..."
 	kubectl port-forward -n $(NAMESPACE) service/swarmer $(LOCAL_PORT):8080
 
+mcp-url: export _URL := $(value URL)
+mcp-url:  ## Resolve Swarmer API URL and update opencode.json MCP config
+	@set -e; \
+	if [ -n "$$_URL" ]; then \
+	  RESOLVED_URL="$$_URL"; \
+	  echo "Using explicit URL override: $$RESOLVED_URL"; \
+	  echo "export AGENT_SWARM_API_URL=\"$$RESOLVED_URL\""; \
+	  python3 scripts/update_opencode_config.py "$$RESOLVED_URL" "opencode.json"; \
+	  exit 0; \
+	fi; \
+	if ! command -v kubectl >/dev/null 2>&1; then \
+	  echo "Error: kubectl is not installed or not in PATH" >&2; \
+	  exit 1; \
+	fi; \
+	CTX=$$(kubectl config current-context 2>/dev/null || true); \
+	if [ -z "$$CTX" ]; then \
+	  echo "Error: No Kubernetes context found. Connect to a cluster first (e.g. 'oc login' or 'kubectl config use-context <name>')." >&2; \
+	  exit 1; \
+	fi; \
+	if ! kubectl get deployment swarmer -n $(NAMESPACE) >/dev/null 2>&1 && \
+	   ! kubectl get svc swarmer -n $(NAMESPACE) >/dev/null 2>&1; then \
+	  echo "Error: Swarmer deployment/service not found in namespace '$(NAMESPACE)' on context '$$CTX' (or cluster unreachable / insufficient permissions)." >&2; \
+	  exit 1; \
+	fi; \
+	RESOLVED_URL=""; \
+	ROUTE_HOST=$$(kubectl get route swarmer -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null || true); \
+	if [ -n "$$ROUTE_HOST" ]; then \
+	  ROUTE_TLS=$$(kubectl get route swarmer -n $(NAMESPACE) -o jsonpath='{.spec.tls}' 2>/dev/null || true); \
+	  if [ -n "$$ROUTE_TLS" ]; then \
+	    SCHEME="https"; \
+	  else \
+	    SCHEME="http"; \
+	  fi; \
+	  RESOLVED_URL="$$SCHEME://$$ROUTE_HOST"; \
+	fi; \
+	if [ -z "$$RESOLVED_URL" ]; then \
+	  IS_KIND=0; \
+	  case "$$CTX" in \
+	    kind-*) IS_KIND=1 ;; \
+	  esac; \
+	  if [ "$$IS_KIND" -eq 0 ]; then \
+	    NODE_PROVIDER=$$(kubectl get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null || true); \
+	    case "$$NODE_PROVIDER" in \
+	      kind://*) IS_KIND=1 ;; \
+	    esac; \
+	  fi; \
+	  if [ "$$IS_KIND" -eq 1 ]; then \
+	    RESOLVED_URL="http://localhost:$(LOCAL_PORT)"; \
+	  fi; \
+	fi; \
+	if [ -z "$$RESOLVED_URL" ]; then \
+	  INGRESS_HOST=$$(kubectl get ingress swarmer -n $(NAMESPACE) -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true); \
+	  if [ -n "$$INGRESS_HOST" ]; then \
+	    INGRESS_TLS=$$(kubectl get ingress swarmer -n $(NAMESPACE) -o jsonpath='{.spec.tls[0]}' 2>/dev/null || true); \
+	    if [ -n "$$INGRESS_TLS" ]; then \
+	      SCHEME="https"; \
+	    else \
+	      SCHEME="http"; \
+	    fi; \
+	    RESOLVED_URL="$$SCHEME://$$INGRESS_HOST"; \
+	  fi; \
+	fi; \
+	if [ -z "$$RESOLVED_URL" ]; then \
+	  LB_HOST=$$(kubectl get svc swarmer -n $(NAMESPACE) -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true); \
+	  LB_IP=$$(kubectl get svc swarmer -n $(NAMESPACE) -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true); \
+	  HOST_OR_IP="$${LB_HOST:-$$LB_IP}"; \
+	  if [ -n "$$HOST_OR_IP" ]; then \
+	    PORT=$$(kubectl get svc swarmer -n $(NAMESPACE) -o jsonpath='{.spec.ports[?(@.name=="http")].port}' 2>/dev/null || true); \
+	    PORT="$${PORT:-8080}"; \
+	    RESOLVED_URL="http://$$HOST_OR_IP:$$PORT"; \
+	  fi; \
+	fi; \
+	if [ -z "$$RESOLVED_URL" ]; then \
+	  NODE_IP=$$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || true); \
+	  if [ -z "$$NODE_IP" ]; then \
+	    NODE_IP=$$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true); \
+	  fi; \
+	  NODE_PORT=$$(kubectl get svc swarmer -n $(NAMESPACE) -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || true); \
+	  if [ -n "$$NODE_IP" ] && [ -n "$$NODE_PORT" ]; then \
+	    RESOLVED_URL="http://$$NODE_IP:$$NODE_PORT"; \
+	  fi; \
+	fi; \
+	if [ -z "$$RESOLVED_URL" ]; then \
+	  echo "Error: Could not resolve a reachable Swarmer URL. Run 'make connect' in another terminal and retry with URL=http://localhost:$(LOCAL_PORT)." >&2; \
+	  exit 1; \
+	fi; \
+	echo "export AGENT_SWARM_API_URL=\"$$RESOLVED_URL\""; \
+	python3 scripts/update_opencode_config.py "$$RESOLVED_URL" "opencode.json"
+
+mcp-api: mcp-setup  ## Alias for mcp-setup
+api-url: mcp-url  ## Alias for mcp-url
+
 openshell-register:  ## Register (or refresh) the active cluster's OpenShell gateway in the local CLI
 	@# Derive a stable gateway name from the current kubectl context
 	@CTX=$$(kubectl config current-context 2>/dev/null || echo "unknown"); \
@@ -601,6 +722,9 @@ kind-deploy:  ## One-shot local dev: create kind cluster + build + load image + 
 	fi
 	@echo "✓ Image loaded."
 	$(MAKE) deploy SILENT=1
+	@echo "Restarting swarmer deployment to ensure latest loaded image is running..."
+	kubectl rollout restart deployment/swarmer -n $(NAMESPACE)
+	kubectl rollout status deployment/swarmer -n $(NAMESPACE) --timeout=120s
 	@echo ""
 	@echo "╔══════════════════════════════════════════════════════╗"
 	@echo "║  Swarmer is running in kind!                         ║"

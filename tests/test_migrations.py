@@ -45,16 +45,7 @@ async def _setup(monkeypatch):
     orig_ns = settings.k8s_namespace
     settings.k8s_namespace = ""  # must be empty to allow workspace creation
 
-    async def _all_accessible(token, namespaces, api_url, in_cluster):
-        return list(namespaces)
-
-    async def _can_create_namespaces(token, api_url, in_cluster):
-        return True
-
-    monkeypatch.setattr("swarmer.api.deps.get_accessible_namespaces", _all_accessible)
-    monkeypatch.setattr("swarmer.api.v1.workspaces.can_create_namespaces", _can_create_namespaces)
     monkeypatch.setattr("swarmer.k8s.ensure_namespace", lambda namespace: None)
-    monkeypatch.setattr("swarmer.k8s.grant_swarmer_user_access", lambda namespace, username: None)
     monkeypatch.setattr("swarmer.k8s.delete_namespace", lambda namespace: None)
 
     import swarmer.models  # noqa: F401
@@ -165,6 +156,110 @@ class TestMigrateDbDropsLegacyColumns:
             db_module._engine = orig_engine
 
 
+class TestWorkspaceMemberBackfill:
+    """ACM-41659 follow-up: migrate_db() must backfill workspace_members and
+    Workspace.owner_id from existing per-user credential tables, so nobody
+    has to be manually re-added to a workspace they already had access to."""
+
+    @pytest.mark.asyncio
+    async def test_backfills_members_and_owner_from_secrets_and_pats(self):
+        async with _engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO workspaces (id, display_name, namespace, description, owner_id) "
+                "VALUES (1, 'Team A', 'team-a', '', '')"
+            ))
+            await conn.execute(text(
+                "INSERT INTO opencode_secrets "
+                "(workspace_id, user_id, google_cloud_project, vertex_location, "
+                " application_default_credentials_enc, google_api_key_enc, created_at) "
+                "VALUES (1, 'alice', '', '', '', '', '2020-01-01T00:00:00')"
+            ))
+            await conn.execute(text(
+                "INSERT INTO github_pats "
+                "(workspace_id, user_id, name, github_username, github_org, pat_enc, description, created_at) "
+                "VALUES (1, 'bob', 'x', 'bob', '', 'enc', '', '2019-01-01T00:00:00')"
+            ))
+            # A second, never-used workspace — must remain ownerless (falls
+            # through to workspace_acl's "claim on write" fallback).
+            await conn.execute(text(
+                "INSERT INTO workspaces (id, display_name, namespace, description, owner_id) "
+                "VALUES (2, 'Team B', 'team-b', '', '')"
+            ))
+
+        import swarmer.database as db_module
+
+        orig_engine = db_module._engine
+        db_module._engine = _engine
+        try:
+            await db_module.migrate_db()
+        finally:
+            db_module._engine = orig_engine
+
+        async with _engine.begin() as conn:
+            result = await conn.execute(text("SELECT id, owner_id FROM workspaces ORDER BY id"))
+            owners = dict(result.fetchall())
+            result = await conn.execute(
+                text("SELECT workspace_id, user_id FROM workspace_members ORDER BY workspace_id, user_id")
+            )
+            members = result.fetchall()
+
+        # bob's PAT predates alice's secret (2019 < 2020) — bob becomes owner.
+        assert owners[1] == "bob"
+        assert owners[2] == ""
+        assert (1, "alice") in members
+        assert (1, "bob") in members
+        assert not any(row[0] == 2 for row in members)
+
+    @pytest.mark.asyncio
+    async def test_does_not_overwrite_existing_owner(self):
+        async with _engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO workspaces (id, display_name, namespace, description, owner_id) "
+                "VALUES (3, 'Team C', 'team-c', '', 'carol')"
+            ))
+            await conn.execute(text(
+                "INSERT INTO opencode_secrets "
+                "(workspace_id, user_id, google_cloud_project, vertex_location, "
+                " application_default_credentials_enc, google_api_key_enc, created_at) "
+                "VALUES (3, 'dave', '', '', '', '', '2018-01-01T00:00:00')"
+            ))
+
+        import swarmer.database as db_module
+
+        orig_engine = db_module._engine
+        db_module._engine = _engine
+        try:
+            await db_module.migrate_db()
+        finally:
+            db_module._engine = orig_engine
+
+        async with _engine.begin() as conn:
+            result = await conn.execute(text("SELECT owner_id FROM workspaces WHERE id = 3"))
+            assert result.scalar_one() == "carol"
+            result = await conn.execute(
+                text("SELECT user_id FROM workspace_members WHERE workspace_id = 3")
+            )
+            # dave is still added as a member even though carol keeps ownership
+            assert result.scalar_one() == "dave"
+
+    @pytest.mark.asyncio
+    async def test_global_admins_table_created(self):
+        import swarmer.database as db_module
+
+        orig_engine = db_module._engine
+        db_module._engine = _engine
+        try:
+            await db_module.migrate_db()
+        finally:
+            db_module._engine = orig_engine
+
+        async with _engine.begin() as conn:
+            result = await conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='global_admins'")
+            )
+            assert result.fetchone() is not None
+
+
 class TestSessionFormCreatePath:
     """ACM-35375: The HTML form POST /workspaces/{ws_id}/sessions must succeed.
 
@@ -258,3 +353,86 @@ class TestSessionFormCreatePath:
         assert resp2.status_code == 422, (
             f"Expected 422 for duplicate name, got {resp2.status_code}: {resp2.text[:200]}"
         )
+
+
+class TestPrActionStateMigration:
+    """ACM-43054: migrate_db() must idempotently add session_id to pr_action_state
+    and recreate uq_pr_action_state_key index including session_id."""
+
+    @pytest.mark.asyncio
+    async def test_migrate_db_adds_session_id_to_legacy_pr_action_state(self) -> None:
+        # Recreate a legacy pr_action_state table without session_id
+        async with _engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS pr_action_state"))
+            await conn.execute(text("""
+                CREATE TABLE pr_action_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo VARCHAR(255) NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    head_sha VARCHAR(64) NOT NULL,
+                    action VARCHAR(32) NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'dispatched',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    last_dispatched_at DATETIME,
+                    created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+                    updated_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+                )
+            """))
+            await conn.execute(text("""
+                CREATE UNIQUE INDEX uq_pr_action_state_key
+                ON pr_action_state (repo, pr_number, head_sha, action)
+            """))
+
+        # Verify session_id does not exist before migration
+        async with _engine.begin() as conn:
+            result = await conn.execute(text("PRAGMA table_info(pr_action_state)"))
+            cols_before = [row[1] for row in result.fetchall()]
+        assert "session_id" not in cols_before
+
+        # Run migrate_db()
+        import swarmer.database as db_module
+
+        orig_engine = db_module._engine
+        db_module._engine = _engine
+        try:
+            await db_module.migrate_db()
+
+            # Verify session_id column exists
+            async with _engine.begin() as conn:
+                result = await conn.execute(text("PRAGMA table_info(pr_action_state)"))
+                cols_after = [row[1] for row in result.fetchall()]
+            assert "session_id" in cols_after
+
+            # Verify the unique index includes all 5 columns
+            async with _engine.begin() as conn:
+                result = await conn.execute(text("PRAGMA index_info(uq_pr_action_state_key)"))
+                indexed_cols = [row[2] for row in result.fetchall()]
+            assert indexed_cols == ["repo", "pr_number", "head_sha", "action", "session_id"]
+
+            # Verify multiple sessions can now record actions for the same PR and head SHA
+            async with _engine.begin() as conn:
+                await conn.execute(text("""
+                    INSERT INTO pr_action_state (repo, pr_number, head_sha, action, session_id)
+                    VALUES ('test-repository', 1, 'sha1', 'ci_fail_or_conflict', 10)
+                """))
+                await conn.execute(text("""
+                    INSERT INTO pr_action_state (repo, pr_number, head_sha, action, session_id)
+                    VALUES ('test-repository', 1, 'sha1', 'ci_fail_or_conflict', 20)
+                """))
+
+            # Verify unique constraint enforces duplicate prevention for identical keys
+            from sqlalchemy.exc import IntegrityError
+
+            with pytest.raises(IntegrityError):
+                async with _engine.begin() as conn:
+                    await conn.execute(text("""
+                        INSERT INTO pr_action_state (repo, pr_number, head_sha, action, session_id)
+                        VALUES ('test-repository', 1, 'sha1', 'ci_fail_or_conflict', 10)
+                    """))
+
+            # Running migrate_db() again must be idempotent and succeed without error
+            await db_module.migrate_db()
+        finally:
+            db_module._engine = orig_engine
+

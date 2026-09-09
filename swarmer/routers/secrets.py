@@ -3,6 +3,8 @@
 All data access goes through the REST API client (/api/v1/).
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -16,6 +18,7 @@ from swarmer.routers.api_client import APIError, get_api_client
 
 router = APIRouter()
 templates = Jinja2Templates(directory="swarmer/templates")
+log = logging.getLogger(__name__)
 
 _VALID_TABS = ("credentials", "pats", "github-app", "pull-secret")
 
@@ -25,10 +28,10 @@ def _current_user(request: Request) -> str:
     return request.session.get("username", "")
 
 
-def _csrf_redirect(ws_id: int, request: Request) -> RedirectResponse:
+def _csrf_redirect(ws_id: int, request: Request, tab: str = "github-app") -> RedirectResponse:
     flash(request, "Invalid or missing CSRF token.", "danger")
     return RedirectResponse(
-        url=f"/workspaces/{ws_id}/secrets?tab=github-app",
+        url=f"/workspaces/{ws_id}/secrets?tab={tab}",
         status_code=302,
     )
 
@@ -59,12 +62,47 @@ async def _secrets_context(api, ws_id: int) -> dict:
     # Check gateway for Vertex AI (google-cloud) provider — ADC is stored on OpenShell,
     # not in the Swarmer DB, so the gateway is the source of truth for this status.
     vertex_provider_configured = False
+    vertex_provider_check_failed = False
     try:
         vertex_provider_configured = await openshell_client.provider_exists(
             f"swarmer-ws-{ws_id}-google-cloud"
         )
     except Exception:
+        vertex_provider_check_failed = True
         pass  # gateway may be unreachable in local dev without OpenShell
+
+    # Check gateway for the Google AI Studio (Gemini) provider — same pattern as
+    # Vertex ADC: the key is pushed to the gateway at save time and never stored
+    # encrypted in the Swarmer DB (ACM-37263).
+    gemini_provider_configured = False
+    gemini_provider_check_failed = False
+    try:
+        oc_client = await openshell_client.get_client_for_workspace(ws_id)
+        vertex_provider_configured = await openshell_client.provider_exists(
+            f"swarmer-ws-{ws_id}-google-cloud", client=oc_client
+        )
+        gemini_provider_configured = await openshell_client.provider_exists(
+            f"swarmer-ws-{ws_id}-google-ai-studio", client=oc_client
+        )
+    except Exception:
+        gemini_provider_check_failed = True
+        pass  # gateway may be unreachable in local dev without OpenShell
+
+    # Check gateway for the OpenAI provider — same gateway-only pattern as
+    # Gemini/Vertex: key is pushed at save time and never stored in Swarmer DB.
+    openai_provider_configured = False
+    openai_provider_check_failed = False
+    try:
+        openai_provider_configured = await openshell_client.provider_exists(
+            f"swarmer-ws-{ws_id}-openai"
+        )
+    except Exception:
+        openai_provider_check_failed = True
+        pass  # gateway may be unreachable in local dev without OpenShell
+
+    vertex_intent = bool(secret and secret.get("has_vertex"))
+    gemini_intent = bool(secret and secret.get("has_gemini"))
+    openai_intent = bool(secret and secret.get("has_openai"))
 
     return {
         "secret": secret,
@@ -72,6 +110,11 @@ async def _secrets_context(api, ws_id: int) -> dict:
         "pull_secret_info": pull_secret_info,
         "github_app": github_app,
         "vertex_provider_configured": vertex_provider_configured,
+        "gemini_provider_configured": gemini_provider_configured,
+        "openai_provider_configured": openai_provider_configured,
+        "vertex_provider_missing": vertex_intent and not vertex_provider_configured and not vertex_provider_check_failed,
+        "gemini_provider_missing": gemini_intent and not gemini_provider_configured and not gemini_provider_check_failed,
+        "openai_provider_missing": openai_intent and not openai_provider_configured and not openai_provider_check_failed,
     }
 
 
@@ -135,6 +178,7 @@ async def opencode_secret_save(
     google_cloud_project: str = Form(""),
     vertex_location: str = Form(""),
     google_api_key: str = Form(""),
+    openai_api_key: str = Form(""),
     shared: str = Form(""),
     adc_file: UploadFile | None = File(None),
 ):
@@ -172,36 +216,137 @@ async def opencode_secret_save(
         except APIError:
             return RedirectResponse(url="/workspaces", status_code=302)
 
+    # Push credentials to the OpenShell gateway BEFORE touching the DB. Each
+    # provider is configured independently so a failure on one does not affect
+    # the other, and the DB save below (project/location/shared, plus the
+    # already-blank legacy fields) only happens once we know the outcome of
+    # both pushes — avoiding a "credentials saved" message that masks a gateway
+    # failure, and never discarding a previously-working provider based on an
+    # ordering assumption.
+
+    # Push Vertex AI credentials to OpenShell gateway if ADC was provided.
+    # The gateway stores and auto-refreshes the credential; Swarmer never persists it.
+    vertex_configured = False
+    try:
+        oc_client = await openshell_client.get_client_for_workspace(ws_id)
+    except Exception:
+        log.warning("credential_save: failed to resolve gateway for workspace %d", ws_id, exc_info=True)
+        flash(
+            request,
+            "Failed to resolve workspace OpenShell gateway client.",
+            "danger",
+        )
+        return RedirectResponse(url=f"/workspaces/{ws_id}/secrets?tab=credentials", status_code=302)
+    if adc_content and google_cloud_project and vertex_location:
+        provider_name = f"swarmer-ws-{ws_id}-google-cloud"
         try:
-            # Save project/region to DB (non-secret config).
-            # ADC JSON is NOT stored in the Swarmer DB — it is pushed exclusively to
-            # the OpenShell gateway below so credentials never persist in Swarmer.
+            await openshell_client.create_google_cloud_provider(
+                provider_name, google_cloud_project, vertex_location, client=oc_client
+            )
+            await openshell_client.configure_google_cloud_provider(
+                provider_name, adc_content, client=oc_client
+            )
+            vertex_configured = True
+        except Exception as exc:
+            flash(request, f"Failed to configure Vertex AI on OpenShell: {exc}", "danger")
+    elif adc_content and not (google_cloud_project and vertex_location):
+        flash(request, "ADC file provided but GCP Project ID and Vertex AI Region are required to configure the provider.", "warning")
+
+    # Push the Gemini (Google AI Studio) API key to the OpenShell gateway if a new
+    # key was submitted. A blank submission is a no-op — leaves the existing gateway
+    # provider (if any) untouched, mirroring the ADC "leave blank to keep" behavior.
+    gemini_key = google_api_key.strip()
+    if gemini_key:
+        pname = f"swarmer-ws-{ws_id}-google-ai-studio"
+        try:
+            await openshell_client.ensure_provider(
+                pname, "google-ai-studio", {},
+                credentials={
+                    "GOOGLE_API_KEY": gemini_key,
+                    "GOOGLE_GENERATIVE_AI_API_KEY": gemini_key,
+                },
+                client=oc_client,
+            )
+        except Exception:
+            log.warning(
+                "credential_save: failed to configure Gemini provider for workspace %d",
+                ws_id,
+                exc_info=True,
+            )
+            flash(request, "Failed to configure Gemini on OpenShell.", "danger")
+
+    # Push the OpenAI API key to the OpenShell gateway if submitted. Blank is
+    # a no-op, keeping any existing provider credential unchanged.
+    openai_key = openai_api_key.strip()
+    if openai_key:
+        pname = f"swarmer-ws-{ws_id}-openai"
+        try:
+            await openshell_client.ensure_provider(
+                pname,
+                "openai",
+                {},
+                credentials={"OPENAI_API_KEY": openai_key},
+                client=oc_client,
+            )
+        except Exception:
+            log.warning(
+                "credential_save: failed to configure OpenAI provider for workspace %d",
+                ws_id,
+                exc_info=True,
+            )
+            flash(request, "Failed to configure OpenAI on OpenShell.", "danger")
+
+    async with get_api_client(request) as api:
+        try:
+            # Save project/region to DB (non-secret config) last, now that any
+            # gateway pushes above have already run. ADC JSON and the Gemini API
+            # key are NOT stored in the Swarmer DB — both are pushed exclusively
+            # to the OpenShell gateway above so credentials never persist in
+            # Swarmer (ACM-37263). The API layer only overwrites
+            # google_api_key/application_default_credentials when a non-blank
+            # value is submitted, so passing "" here never clears a legacy
+            # pre-migration key still stored for a workspace that hasn't
+            # rotated it yet (see api/v1/secrets.py:save_credentials).
             await api.save_credentials(
                 ws_id,
                 google_cloud_project=google_cloud_project,
                 vertex_location=vertex_location,
-                google_api_key=google_api_key,
+                google_api_key="",  # intentionally empty — gateway is the store
+                openai_api_key="",  # intentionally empty — gateway is the store
                 application_default_credentials="",  # intentionally empty — gateway is the store
+                gemini_configured=True if gemini_key else None,
+                openai_configured=True if openai_key else None,
+                vertex_configured=True if vertex_configured else None,
                 shared=bool(shared),
             )
         except APIError as exc:
             flash(request, f"Failed to save credentials: {exc.detail}", "danger")
             return RedirectResponse(url=f"/workspaces/{ws_id}/secrets?tab=credentials", status_code=302)
 
-    # Push Vertex AI credentials to OpenShell gateway if ADC was provided.
-    # The gateway stores and auto-refreshes the credential; Swarmer never persists it.
-    if adc_content and google_cloud_project and vertex_location:
-        provider_name = f"swarmer-ws-{ws_id}-google-cloud"
-        try:
-            await openshell_client.create_google_cloud_provider(
-                provider_name, google_cloud_project, vertex_location
-            )
-            await openshell_client.configure_google_cloud_provider(provider_name, adc_content)
-        except Exception as exc:
-            flash(request, f"Credentials saved, but failed to configure Vertex AI on OpenShell: {exc}", "warning")
-    elif adc_content and not (google_cloud_project and vertex_location):
-        flash(request, "ADC file provided but GCP Project ID and Vertex AI Region are required to configure the provider.", "warning")
+    return RedirectResponse(url=f"/workspaces/{ws_id}/secrets?tab=credentials", status_code=302)
 
+
+@router.post(
+    "/workspaces/{ws_id}/secrets/opencode/{provider}/delete",
+    dependencies=[Depends(require_auth)],
+)
+async def opencode_credential_delete(
+    ws_id: int,
+    provider: str,
+    request: Request,
+    csrf_token: str = Form(""),
+) -> RedirectResponse:
+    try:
+        validate_csrf_token(request, csrf_token)
+    except CSRFError:
+        return _csrf_redirect(ws_id, request, tab="credentials")
+
+    try:
+        async with get_api_client(request) as api:
+            await api.delete_credential(ws_id, provider)
+        flash(request, "Credential deleted.", "success")
+    except APIError as exc:
+        flash(request, f"Failed to delete credential: {exc.detail}", "danger")
     return RedirectResponse(url=f"/workspaces/{ws_id}/secrets?tab=credentials", status_code=302)
 
 
@@ -222,7 +367,7 @@ async def github_pat_new(ws_id: int, request: Request):
     return templates.TemplateResponse(
         request,
         "secrets/github_pat_form.html",
-        {"ws": ws, "pat": None},
+        {"ws": ws, "pat": None, "csrf_token": ensure_csrf_token(request)},
     )
 
 
@@ -239,7 +384,13 @@ async def github_pat_create(
     pat_value: str = Form(...),
     description: str = Form(""),
     shared: str = Form(""),
-):
+    csrf_token: str = Form(""),
+) -> Response:
+    try:
+        validate_csrf_token(request, csrf_token)
+    except CSRFError:
+        return _csrf_redirect(ws_id, request, tab="pats")
+
     async with get_api_client(request) as api:
         try:
             ws = await api.get_workspace(ws_id)
@@ -263,6 +414,7 @@ async def github_pat_create(
                 {
                     "ws": ws,
                     "pat": None,
+                    "csrf_token": ensure_csrf_token(request),
                     "error": exc.detail,
                     "form": {
                         "name": name,
@@ -307,7 +459,7 @@ async def github_pat_edit_form(
     return templates.TemplateResponse(
         request,
         "secrets/github_pat_form.html",
-        {"ws": ws, "pat": pat},
+        {"ws": ws, "pat": pat, "csrf_token": ensure_csrf_token(request)},
     )
 
 
@@ -325,7 +477,13 @@ async def github_pat_update(
     pat_value: str = Form(""),
     description: str = Form(""),
     shared: str = Form(""),
-):
+    csrf_token: str = Form(""),
+) -> RedirectResponse:
+    try:
+        validate_csrf_token(request, csrf_token)
+    except CSRFError:
+        return _csrf_redirect(ws_id, request, tab="pats")
+
     fields: dict = {
         "name": name.strip(),
         "github_username": github_username.strip(),
@@ -357,7 +515,13 @@ async def github_pat_delete(
     ws_id: int,
     pat_id: int,
     request: Request,
-):
+    csrf_token: str = Form(""),
+) -> RedirectResponse:
+    try:
+        validate_csrf_token(request, csrf_token)
+    except CSRFError:
+        return _csrf_redirect(ws_id, request, tab="pats")
+
     async with get_api_client(request) as api:
         try:
             await api.delete_pat(ws_id, pat_id)

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, Field
-
-from swarmer.models.session import DEFAULT_EPHEMERAL_DISK, EPHEMERAL_DISK_OPTIONS
-
-_EPHEMERAL_DISK_PATTERN = r"^(" + "|".join(EPHEMERAL_DISK_OPTIONS) + r")$"
+from pydantic import BaseModel, Field, field_validator
+from urllib.parse import urlparse
 
 
 # ============================================================
@@ -16,9 +14,110 @@ _EPHEMERAL_DISK_PATTERN = r"^(" + "|".join(EPHEMERAL_DISK_OPTIONS) + r")$"
 # ============================================================
 
 
+class WorkspaceGatewayCreate(BaseModel):
+    gateway_url: str = Field(..., min_length=1, max_length=1024)
+    auth_mode: str = Field("oidc", max_length=32)
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_audience: str | None = None
+    refresh_token: str | None = None
+    access_token: str | None = None
+    bearer_token: str | None = None
+    tls_ca: str | None = None
+    tls_cert: str | None = None
+    tls_key: str | None = None
+    tls_verify: bool = True
+
+
+class WorkspaceGatewayOut(BaseModel):
+    workspace_id: int
+    gateway_url: str
+    auth_mode: str
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_audience: str | None = None
+    has_refresh_token: bool = False
+    has_access_token: bool = False
+    access_token_expires_at: datetime | None = None
+    has_bearer_token: bool = False
+    has_tls_cert: bool = False
+    has_tls_key: bool = False
+    tls_ca: str | None = None
+    tls_verify: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ParseGatewayCommandIn(BaseModel):
+    command: str = Field(..., min_length=1)
+
+
+class ParseGatewayCommandOut(BaseModel):
+    gateway_url: str = ""
+    auth_mode: str = "oidc"
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_audience: str | None = None
+    bearer_token: str | None = None
+    tls_verify: bool = True
+    suggested_name: str | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class ParseTokenIn(BaseModel):
+    token_input: str = Field(..., min_length=1)
+
+
+class ParseTokenOut(BaseModel):
+    refresh_token: str = ""
+    access_token: str = ""
+    expires_at: int | None = None
+    issuer: str | None = None
+    client_id: str | None = None
+    format_detected: str = "raw"
+    status: str = "valid"
+    message: str = ""
+    char_count: int = 0
+
+
+class TestGatewayConnectionIn(BaseModel):
+    workspace_id: int | None = None
+    gateway_url: str = Field(..., min_length=1)
+    auth_mode: str = "oidc"
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_audience: str | None = None
+    refresh_token: str | None = None
+    bearer_token: str | None = None
+    tls_ca: str | None = None
+    tls_cert: str | None = None
+    tls_key: str | None = None
+    tls_verify: bool = True
+
+    @field_validator("gateway_url")
+    @classmethod
+    def validate_gateway_url(cls, value: str) -> str:
+        value = value.strip()
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("gateway_url must be an http(s) URL with a host")
+        return value
+
+
+class TestGatewayConnectionOut(BaseModel):
+    status: str = "ok"
+    gateway_url: str = ""
+    auth_mode: str = ""
+    sandboxes_count: int = 0
+    detail: str = ""
+
+
 class WorkspaceCreate(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=255)
     description: str = ""
+    gateway: WorkspaceGatewayCreate | None = None
 
 
 class WorkspaceUpdate(BaseModel):
@@ -31,10 +130,63 @@ class WorkspaceOut(BaseModel):
     display_name: str
     namespace: str
     description: str
+    owner_id: str = ""
+    gateway: WorkspaceGatewayOut | None = None
     created_at: datetime
     updated_at: datetime
+    ai_provider_warning: bool = False
+    missing_ai_providers: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
+
+
+# ============================================================
+# Workspace Members (ACM-41659) — database-backed workspace ACL
+# ============================================================
+
+
+class WorkspaceMemberCreate(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=255)
+    role: str = "member"
+
+
+class WorkspaceMemberOut(BaseModel):
+    id: int
+    workspace_id: int
+    user_id: str
+    role: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ============================================================
+# Global Admins (ACM-41659) — simple self-service admin flow
+# ============================================================
+
+
+class GlobalAdminCreate(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=255)
+
+
+class GlobalAdminOut(BaseModel):
+    id: int
+    user_id: str
+    created_by: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class MeOut(BaseModel):
+    username: str
+    is_admin: bool
+    can_create_workspace: bool
+    admin_bootstrap_available: bool
+
+
+class KnownUsersOut(BaseModel):
+    users: list[str]
 
 
 # ============================================================
@@ -43,29 +195,47 @@ class WorkspaceOut(BaseModel):
 
 
 class ScheduleEntryCreate(BaseModel):
-    cron_schedule: str = Field(..., min_length=1, max_length=128)
+    trigger_type: str = Field("cron", pattern=r"^(cron|event)$")
+    cron_schedule: str = Field("", max_length=128)
+    event_condition: str = Field("", max_length=64, pattern=r"^(|ci_fail_or_conflict|new_pr_or_commit|review_comments|any_actionable)$")
+    author_scope: str = Field("all", max_length=32, pattern=r"^(self|team|bots|all)$")
+    fix_authors: str = Field("", max_length=512)
     label: str = ""
-    prompt_id: int | None = None
+    prompt_id: int
+    provider: str = Field("", max_length=128, pattern=r"^(|claude|gemini|openai)$")
     instruction_prompt: str = ""
+    include_event_context: bool = True
     enabled: bool = True
 
 
 class ScheduleEntryUpdate(BaseModel):
-    cron_schedule: str | None = Field(None, min_length=1, max_length=128)
+    trigger_type: str | None = Field(None, pattern=r"^(cron|event)$")
+    cron_schedule: str | None = Field(None, max_length=128)
+    event_condition: str | None = Field(None, max_length=64, pattern=r"^(|ci_fail_or_conflict|new_pr_or_commit|review_comments|any_actionable)$")
+    author_scope: str | None = Field(None, max_length=32, pattern=r"^(self|team|bots|all)$")
+    fix_authors: str | None = Field(None, max_length=512)
     label: str | None = None
     prompt_id: int | None = None
+    provider: str | None = Field(None, max_length=128, pattern=r"^(|claude|gemini|openai)$")
     instruction_prompt: str | None = None
+    include_event_context: bool | None = None
     enabled: bool | None = None
 
 
 class ScheduleEntryOut(BaseModel):
     id: int
     session_id: int
+    trigger_type: str = "cron"
+    event_condition: str = ""
+    author_scope: str = "all"
+    fix_authors: str = ""
     cron_schedule: str
     cron_next_run: datetime | None
     label: str
     prompt_id: int | None
+    provider: str = ""
     instruction_prompt: str
+    include_event_context: bool = True
     enabled: bool
     created_at: datetime
     updated_at: datetime
@@ -88,7 +258,6 @@ class SessionCreate(BaseModel):
     prompt_id: int | None = None
     working_branch: str = ""
     mcp_server_ids: list[int] = Field(default_factory=list)
-    ephemeral_disk: str = Field(DEFAULT_EPHEMERAL_DISK, pattern=_EPHEMERAL_DISK_PATTERN)
 
 
 class SessionUpdate(BaseModel):
@@ -101,7 +270,6 @@ class SessionUpdate(BaseModel):
     prompt_id: int | None = None
     working_branch: str | None = None
     mcp_server_ids: list[int] | None = None
-    ephemeral_disk: str | None = Field(None, pattern=_EPHEMERAL_DISK_PATTERN)
 
 
 class SessionOut(BaseModel):
@@ -115,7 +283,6 @@ class SessionOut(BaseModel):
     github_pat_id: int | None
     prompt_id: int | None
     working_branch: str
-    ephemeral_disk: str
     phase: str
     status_detail: str
     sandbox_name: str | None = None
@@ -149,8 +316,19 @@ class SessionRunOut(BaseModel):
     run_duration: str
     last_output: str
     raw_output: str = ""
+    schedule_label: str = ""
+    prompt_name: str = ""
+    mode: str = "prompt"
+    trigger_type: str = "manual"
+    event_context: str = ""
 
     model_config = {"from_attributes": True}
+
+
+class SessionLaunchRequest(BaseModel):
+    pr_context: dict[str, Any] | None = None
+    event_context: str | None = None
+    instruction_prompt: str | None = None
 
 
 class ScheduleRequest(BaseModel):
@@ -200,8 +378,14 @@ class CredentialsSave(BaseModel):
     google_cloud_project: str = ""
     vertex_location: str = ""
     google_api_key: str = ""
+    openai_api_key: str = ""
     application_default_credentials: str = ""
     shared: bool = False
+    # Non-secret markers used by the console when credentials are stored only
+    # on OpenShell. None means leave the existing marker unchanged.
+    gemini_configured: bool | None = None
+    openai_configured: bool | None = None
+    vertex_configured: bool | None = None
 
 
 class CredentialsOut(BaseModel):
@@ -213,6 +397,11 @@ class CredentialsOut(BaseModel):
     vertex_location: str
     masked_api_key: str
     shared: bool
+    gemini_configured: bool
+    openai_configured: bool
+    vertex_configured: bool
+    has_gemini: bool
+    has_openai: bool
     created_at: datetime
     updated_at: datetime
 

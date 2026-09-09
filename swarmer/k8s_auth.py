@@ -1,3 +1,10 @@
+"""K8s bearer token validation for Console/API login.
+
+Authenticates a user's identity (username + groups) via TokenReview. As of
+ACM-41659, workspace-level authorization is a database-backed ACL (see
+``swarmer.workspace_acl``) rather than per-workspace K8s namespace RBAC, so
+this module no longer performs any SelfSubjectAccessReview checks.
+"""
 from __future__ import annotations
 import base64
 import json
@@ -15,7 +22,7 @@ def _username_from_jwt(token: str) -> str:
         payload_b64 = token.split(".")[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
         payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        return payload.get("sub", "")
+        return str(payload.get("sub") or "")
     except Exception:
         return ""
 
@@ -56,10 +63,15 @@ async def validate_token(token: str, api_url: str, in_cluster: bool) -> TokenIde
             status = resp.status
             if not status.authenticated:
                 return None
+            user = getattr(status, "user", None)
+            username = (getattr(user, "username", None) or "").strip() if user else ""
+            if not username:
+                logger.warning("TokenReview was authenticated but user or username was missing/empty")
+                return None
             return TokenIdentity(
-                username=status.user.username or "",
-                uid=status.user.uid or "",
-                groups=list(status.user.groups or []),
+                username=username,
+                uid=getattr(user, "uid", "") or "",
+                groups=list(getattr(user, "groups", []) or []),
             )
         except ApiException as e:
             if e.status == 403:
@@ -85,125 +97,66 @@ async def _probe_with_user_token(token: str, api_url: str, in_cluster: bool) -> 
     def _do_probe():
         from kubernetes.client.rest import ApiException
         cfg = _make_user_config(token, api_url, in_cluster)
+        jwt_user = _username_from_jwt(token)
+
         with k8s_client.ApiClient(cfg) as api:
-            core = k8s_client.CoreV1Api(api)
+            if jwt_user:
+                # Fast path for JWT tokens (e.g. K8s ServiceAccount tokens)
+                core = k8s_client.CoreV1Api(api)
+                try:
+                    core.list_namespace(_request_timeout=5)
+                    return TokenIdentity(username=jwt_user)
+                except ApiException as e:
+                    if e.status == 403:
+                        return TokenIdentity(username=jwt_user)
+                    return None
+
+            # Non-JWT tokens (e.g. OpenShift OAuth tokens like sha256~...)
+            # 1. Try OpenShift User API (~ returns caller's User object)
             try:
-                core.list_namespace(_request_timeout=5)
-                # 200 — token is valid; extract username from JWT payload
-                return TokenIdentity(username=_username_from_jwt(token))
+                custom_api = k8s_client.CustomObjectsApi(api)
+                user_obj = custom_api.get_cluster_custom_object(
+                    group="user.openshift.io",
+                    version="v1",
+                    plural="users",
+                    name="~",
+                    _request_timeout=5,
+                )
+                if isinstance(user_obj, dict):
+                    username = user_obj.get("metadata", {}).get("name", "")
+                    uid = user_obj.get("metadata", {}).get("uid", "")
+                    groups = list(user_obj.get("groups") or [])
+                    if username:
+                        return TokenIdentity(username=username, uid=uid, groups=groups)
             except ApiException as e:
-                if e.status == 403:
-                    # Authenticated but no list-namespace permission — still valid
-                    return TokenIdentity(username=_username_from_jwt(token))
-                # 401 or other — token itself is invalid
-                return None
+                if e.status == 401:
+                    return None
+            except Exception:
+                pass
+
+            # 2. Try K8s SelfSubjectReview (K8s 1.26+)
+            try:
+                auth_v1 = k8s_client.AuthenticationV1Api(api)
+                ssr = auth_v1.create_self_subject_review(
+                    body=k8s_client.V1SelfSubjectReview(), _request_timeout=5
+                )
+                user_info = getattr(ssr.status, "user_info", None) or getattr(ssr.status, "userInfo", None)
+                if user_info:
+                    username = getattr(user_info, "username", "") or ""
+                    uid = getattr(user_info, "uid", "") or ""
+                    groups = list(getattr(user_info, "groups", []) or [])
+                    if username:
+                        return TokenIdentity(username=username, uid=uid, groups=groups)
+            except ApiException as e:
+                if e.status == 401:
+                    return None
+            except Exception:
+                pass
+
+            # Reject non-JWT tokens if neither OpenShift User API nor SelfSubjectReview yielded an identity
+            logger.warning("Could not resolve identity for non-JWT token via OpenShift User API or SelfSubjectReview")
+            return None
 
     return await asyncio.to_thread(_do_probe)
 
 
-def _self_subject_allowed(
-    token: str,
-    api_url: str,
-    in_cluster: bool,
-    *,
-    verb: str,
-    resource: str,
-    namespace: str = "",
-    name: str = "",
-) -> bool:
-    """Return True when *token* is allowed the given verb on *resource*."""
-    from kubernetes import client as k8s_client
-    from kubernetes.client.rest import ApiException
-
-    attrs = k8s_client.V1ResourceAttributes(
-        verb=verb,
-        resource=resource,
-    )
-    if namespace:
-        attrs.namespace = namespace
-    if name:
-        attrs.name = name
-
-    cfg = _make_user_config(token, api_url, in_cluster)
-    with k8s_client.ApiClient(cfg) as api:
-        authz = k8s_client.AuthorizationV1Api(api)
-        sar = k8s_client.V1SelfSubjectAccessReview(
-            spec=k8s_client.V1SelfSubjectAccessReviewSpec(
-                resource_attributes=attrs,
-            )
-        )
-        try:
-            resp = authz.create_self_subject_access_review(sar, _request_timeout=5)
-            return bool(resp.status.allowed)
-        except ApiException:
-            return False
-
-
-def _namespace_grants_workspace_access(
-    token: str, namespace: str, api_url: str, in_cluster: bool
-) -> bool:
-    """True when *token* can access *namespace* as a swarmer workspace.
-
-    Namespace-scoped RoleBindings to ``swarmer-user`` only downscope
-    namespaced rules (pods get/list). Cluster-scoped namespace GET requires
-    a ClusterRoleBinding and is checked separately for admin identities.
-    """
-    if _self_subject_allowed(
-        token,
-        api_url,
-        in_cluster,
-        namespace=namespace,
-        verb="list",
-        resource="pods",
-    ):
-        return True
-    return _self_subject_allowed(
-        token,
-        api_url,
-        in_cluster,
-        verb="get",
-        resource="namespaces",
-        name=namespace,
-    )
-
-
-async def get_accessible_namespaces(token: str, namespaces: list[str], api_url: str, in_cluster: bool) -> list[str]:
-    """Return workspace namespaces the user token can access via RBAC."""
-    import asyncio
-
-    def _check(ns: str) -> str | None:
-        if _namespace_grants_workspace_access(token, ns, api_url, in_cluster):
-            return ns
-        return None
-
-    results = await asyncio.gather(*[asyncio.to_thread(_check, ns) for ns in namespaces])
-    return [ns for ns in results if ns is not None]
-
-
-async def can_create_namespaces(token: str, api_url: str, in_cluster: bool) -> bool:
-    """Check if the user token can create namespaces (cluster-scoped)."""
-    import asyncio
-
-    return await asyncio.to_thread(
-        _self_subject_allowed,
-        token,
-        api_url,
-        in_cluster,
-        verb="create",
-        resource="namespaces",
-    )
-
-
-async def can_create_pods(token: str, namespace: str, api_url: str, in_cluster: bool) -> bool:
-    """Check if the user token can create pods in the given namespace via SelfSubjectAccessReview."""
-    import asyncio
-
-    return await asyncio.to_thread(
-        _self_subject_allowed,
-        token,
-        api_url,
-        in_cluster,
-        namespace=namespace,
-        verb="create",
-        resource="pods",
-    )
